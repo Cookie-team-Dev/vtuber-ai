@@ -11729,7 +11729,8 @@ def gh_pages_enable():
             [gh_path, "api", "--method", "POST", "repos/Cookie-team-Dev/vtuber-ai/pages", "-f", "build_type=workflow"],
             capture_output=True, text=True, timeout=30
         )
-        if result.returncode == 0:
+        # Success (201) or already enabled (409) both mean Pages is enabled
+        if result.returncode == 0 or "already enabled" in result.stderr:
             return True
         return False
     except Exception:
