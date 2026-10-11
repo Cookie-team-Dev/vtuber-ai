@@ -11750,7 +11750,8 @@ def gh_pages_disable():
             [gh_path, "api", "--method", "DELETE", "repos/Cookie-team-Dev/vtuber-ai/pages"],
             capture_output=True, text=True, timeout=30
         )
-        if result.returncode == 0:
+        # Success (204) or already disabled (404) both mean Pages is disabled
+        if result.returncode == 0 or "Not Found" in result.stderr:
             return True
         return False
     except Exception:
