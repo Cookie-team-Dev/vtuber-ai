@@ -11716,6 +11716,61 @@ def stop_web_server():
     return "I'm not on the web right now."
 
 
+def gh_pages_enable():
+    """Enable GitHub Pages via gh CLI."""
+    import subprocess
+    import os
+
+    gh_path = os.path.expanduser("~/.local/bin/gh")
+    if not os.path.exists(gh_path):
+        gh_path = "gh"
+    try:
+        result = subprocess.run(
+            [gh_path, "api", "--method", "POST", "repos/Cookie-team-Dev/vtuber-ai/pages", "-f", "build_type=workflow"],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode == 0:
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def gh_pages_disable():
+    """Disable GitHub Pages via gh CLI."""
+    import subprocess
+    import os
+
+    gh_path = os.path.expanduser("~/.local/bin/gh")
+    if not os.path.exists(gh_path):
+        gh_path = "gh"
+    try:
+        result = subprocess.run(
+            [gh_path, "api", "--method", "DELETE", "repos/Cookie-team-Dev/vtuber-ai/pages"],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode == 0:
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def gh_pages_deploy():
+    """Trigger a GitHub Pages deploy by committing and pushing."""
+    import subprocess
+    import os
+
+    repo_dir = "/home/cookie/vtuber-ai"
+    try:
+        subprocess.run(["git", "add", "-A"], cwd=repo_dir, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", f"Deploy {__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M')}"], cwd=repo_dir, check=True, capture_output=True)
+        subprocess.run(["git", "push"], cwd=repo_dir, check=True, capture_output=True)
+        return True
+    except Exception:
+        return False
+
+
 def web_server_running():
     """Whether her website is being served by this process."""
     try:
@@ -11744,7 +11799,19 @@ def web_switch_command(text):
 
     if head == "web" or (head == "kookie" and rest and rest[0] == "web"):
         if rest and rest[0] in ("off", "stop", "down", "close"):
-            return stop_web_server()
+            if gh_pages_disable():
+                return "GitHub Pages disabled. Site will be down shortly."
+            return "Failed to disable GitHub Pages."
+        if rest and rest[0] in ("on", "up", "start", "enable"):
+            if gh_pages_enable():
+                if gh_pages_deploy():
+                    return "GitHub Pages enabled and deploy triggered. Site will be live in a minute at https://cookie-team-dev.github.io/vtuber-ai/"
+                return "GitHub Pages enabled. Run /web deploy to push changes."
+            return "Failed to enable GitHub Pages."
+        if rest and rest[0] == "deploy":
+            if gh_pages_deploy():
+                return "Deploy triggered. Check Actions for progress."
+            return "Failed to trigger deploy."
         if rest and rest[0] in ("status", "state"):
             if web_server_running():
                 import webui
