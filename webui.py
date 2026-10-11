@@ -616,7 +616,7 @@ def _relay(payload):
                 headers=headers, method="POST")
             try:
                 with urllib.request.urlopen(
-                        request, timeout=120) as response:
+                        request, timeout=30) as response:
                     raw = response.read().decode(
                         "utf-8", "replace") or "{}"
                     return response.status, raw, None
@@ -658,7 +658,7 @@ def _relay(payload):
         url, data=json.dumps(body).encode("utf-8"),
         headers=headers, method="POST")
     try:
-        with urllib.request.urlopen(request, timeout=120) as response:
+        with urllib.request.urlopen(request, timeout=30) as response:
             data = json.loads(
                 response.read().decode("utf-8", "replace") or "{}")
     except urllib.error.HTTPError as error:
