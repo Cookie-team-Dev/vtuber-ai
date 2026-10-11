@@ -39,6 +39,7 @@ from http.server import BaseHTTPRequestHandler
 from http.server import ThreadingHTTPServer
 
 import controller
+import memory
 import voice
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -286,6 +287,11 @@ def _remember_message(visitor, role, content):
                 json.dump(stored, f, indent=1)
         except OSError:
             pass
+    # Also save to Kookie's main memory for training
+    if role == "user":
+        memory.remember(f"User: {content}")
+    elif role == "assistant":
+        memory.remember(f"AI: {content}")
 
 
 def _synthesize(text, wav_path):

@@ -1216,6 +1216,12 @@ html[data-char="mochi"] .brand em{color:var(--icon)}
       state.history.push({role:'assistant',content:reply});
       window.__kookieRender(wait.querySelector('.t'), reply); window.__kookieCopy(wait, reply);
       if(window.__kookieSpeak) window.__kookieSpeak(reply);
+      // Save chat to server memory for training
+      if(state.cfg){
+        var key = localStorage.getItem('kookie_access') || sessionStorage.getItem('kookie_access');
+        var rememberPayload = {visitor: key ? 'family' : 'stranger', messages: state.history.slice()};
+        fetch((apiBase || '') + '/api/remember', {method:'POST', headers:{'content-type':'application/json', 'x-kookie-key': key}, body: JSON.stringify(rememberPayload)}).catch(function(){});
+      }
     }catch(err){
       if(gen !== state.gen) return;
       state.history.pop();
