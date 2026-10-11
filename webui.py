@@ -466,6 +466,9 @@ def _error_detail(raw, error):
     detail = ""
     try:
         payload = json.loads(raw or "{}")
+        # Some providers (e.g., Gemini) return a list instead of dict
+        if isinstance(payload, list) and payload:
+            payload = payload[0]
         problem = payload.get("error")
         if isinstance(problem, dict):
             detail = str(problem.get("message") or "")
