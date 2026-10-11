@@ -853,6 +853,10 @@ class Handler(BaseHTTPRequestHandler):
             # browser that holds their id.
             self._memory(query)
             return
+        if path == "/api/webmemory":
+            # All web chat memory, for viewing from the frontend.
+            self._webmemory()
+            return
         kind = self._key_kind()
         if kind is None:
             self._unauthorized()
@@ -999,6 +1003,18 @@ class Handler(BaseHTTPRequestHandler):
             200, json.dumps({
                 "history": _memory_of(visitor)
             }),
+            "application/json",
+        )
+
+    def _webmemory(self):
+        """All web chat memory, for viewing from the frontend."""
+        try:
+            with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+                stored = json.load(f)
+        except (OSError, ValueError):
+            stored = []
+        self._send(
+            200, json.dumps({"memory": stored}),
             "application/json",
         )
 

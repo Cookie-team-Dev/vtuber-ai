@@ -2150,6 +2150,36 @@ def export_training_data():
         return f"She could not write her training data out: {error}"
 
 
+def show_web_memory(limit_str=""):
+    """Show recent web chat messages from the website."""
+    try:
+        limit = int(limit_str) if limit_str.isdigit() else 20
+    except ValueError:
+        limit = 20
+    
+    web_memory_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "memory.json")
+    
+    try:
+        with open(web_memory_file, "r", encoding="utf-8") as f:
+            messages = json.load(f)
+    except (OSError, ValueError):
+        return "No web chat memory found."
+    
+    if not messages:
+        return "Web chat memory is empty."
+    
+    lines = [f"Recent web chat messages (last {min(limit, len(messages))} of {len(messages)}):"]
+    for msg in messages[-limit:]:
+        role = msg.get("role", "?")
+        content = msg.get("content", "")
+        at = msg.get("at", "")
+        visitor = msg.get("visitor", "")[:8]
+        role_label = "You" if role == "user" else "Kookie"
+        lines.append(f"  [{at}] {role_label} ({visitor}): {content[:120]}")
+    
+    return "\n".join(lines)
+
+
 def _complete_text(system, prompt, num_predict, temperature, timeout, top_p=0.9, json_mode=False):
     """One completion, preferring the fast model and falling back to the local.
 
@@ -11882,7 +11912,7 @@ def run_cli():
                 # about. Handing them to the model would spend a generation to
                 # be told to run the command that was already typed.
                 command = user.strip().split()
-                if command and command[0].lower() in ("/learn", "/export", "/opinion", "/restart"):
+                if command and command[0].lower() in ("/learn", "/export", "/opinion", "/restart", "/memory", "/webmemory"):
                     verb = command[0].lower()
                     if verb == "/restart":
                         print("Restarting Kookie...")
@@ -11895,6 +11925,8 @@ def run_cli():
                         print(export_training_data())
                     elif verb == "/opinion":
                         print(decide_for_herself(rest))
+                    elif verb in ("/memory", "/webmemory"):
+                        print(show_web_memory(rest))
                     continue
                 queued.append(user)
             user = queued[0]

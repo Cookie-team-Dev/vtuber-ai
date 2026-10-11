@@ -1,2 +1,2 @@
 // Kookie Web Configuration
-window.KOOKIE_API_BASE = 'https://web-production-c82cb.up.railway.app';
+window.KOOKIE_API_BASE = 'https://flags-mystery-corporation-cutting.trycloudflare.com';
