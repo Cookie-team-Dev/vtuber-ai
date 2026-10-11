@@ -758,10 +758,23 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        # CORS headers
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Kookie-Key, X-Kookie-Discord")
         for key, value in (extra or {}).items():
             self.send_header(key, value)
         self.end_headers()
         self.wfile.write(body)
+
+    def do_OPTIONS(self):
+        """Handle CORS preflight requests."""
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Kookie-Key, X-Kookie-Discord")
+        self.send_header("Access-Control-Max-Age", "86400")
+        self.end_headers()
 
     def _file(self, path, ctype):
         try:
