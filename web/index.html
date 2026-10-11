@@ -816,6 +816,7 @@ html[data-char="mochi"] .brand em{color:var(--icon)}
         <div><b>Kookie</b><small id="chatModel">Not connected</small></div>
         <button class="clear xbtn" id="bigBtn" type="button" aria-pressed="false" aria-label="Make chat full screen">Expand</button>
         <button class="clear vbtn" id="voiceBtn" type="button" aria-pressed="false" aria-controls="voiceBar">Voice: Off</button>
+        <button class="clear" id="historyBtn" type="button">History</button>
         <button class="clear" id="clearBtn" type="button">Clear chat</button>
       </div>
       <div class="voicebar" id="voiceBar" hidden>
@@ -1236,6 +1237,24 @@ html[data-char="mochi"] .brand em{color:var(--icon)}
   $('input').addEventListener('input', autosize);
   $('input').addEventListener('keydown', function(e){ if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); send(); } });
   $('clearBtn').addEventListener('click', function(){ state.gen++; state.history=[]; if(window.__kookieStop) window.__kookieStop(); renderLog(); });
+  $('historyBtn').addEventListener('click', async function(){
+    var apiBase = (window.KOOKIE_API_BASE || '').replace(/\/+$/, '');
+    var key = localStorage.getItem('kookie_access') || sessionStorage.getItem('kookie_access');
+    try{
+      var res = await fetch(apiBase + '/api/webmemory', {headers: {'x-kookie-key': key}});
+      var data = await res.json();
+      if(data.memory && data.memory.length){
+        var lines = data.memory.map(function(m){
+          return '[' + m.at + '] ' + (m.role==='user'?'You':'Kookie') + ': ' + m.content;
+        }).join('\n');
+        alert('Chat History (' + data.memory.length + ' messages):\n\n' + lines);
+      } else {
+        alert('No chat history found.');
+      }
+    }catch(e){
+      alert('Could not load history: ' + e.message);
+    }
+  });
 
   /* restore */
   var saved=null;
