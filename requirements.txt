@@ -1,0 +1,7 @@
+requests
+websocket-client
+piper-tts
+numpy
+playwright
+discord.py
+sympy

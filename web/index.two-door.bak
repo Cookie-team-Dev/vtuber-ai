@@ -1,0 +1,826 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Kookie</title>
+<style>
+  :root {
+    --her: #ff9ecf;
+    --her2: #b48cff;
+    --ink: #f6ecff;
+    --mood: #7dffb0;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    display: flex;
+    flex-direction: column;
+    height: 100dvh;
+    color: var(--ink);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: #170d2b;
+    overflow: hidden;
+    text-size-adjust: 100%;
+  }
+
+  /* The room she lives in: drifting light and stars. */
+  .bg { position: fixed; inset: 0; z-index: 0; overflow: hidden; }
+  .blob { position: absolute; border-radius: 50%; filter: blur(70px); opacity: 0.32; }
+  .b1 { width: 65vw; height: 65vw; background: #7a3cff; top: -22vw; left: -18vw;
+        animation: drift1 26s ease-in-out infinite alternate; }
+  .b2 { width: 55vw; height: 55vw; background: #ff5fa2; bottom: -18vw; right: -14vw;
+        animation: drift2 32s ease-in-out infinite alternate; }
+  .b3 { width: 40vw; height: 40vw; background: #3c9dff; top: 38%; left: 52%;
+        animation: drift3 24s ease-in-out infinite alternate; }
+  .stars { position: absolute; inset: -40%; opacity: 0.7;
+           animation: twinkle 7s ease-in-out infinite alternate; }
+  @keyframes drift1 { to { transform: translate(9vw, 7vw) scale(1.15); } }
+  @keyframes drift2 { to { transform: translate(-8vw, -6vw) scale(1.1); } }
+  @keyframes drift3 { to { transform: translate(-10vw, 8vw); } }
+  @keyframes twinkle { from { opacity: 0.35; } to { opacity: 0.8; } }
+
+  header {
+    position: relative;
+    z-index: 2;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: calc(10px + env(safe-area-inset-top)) 16px 10px;
+  }
+  header h1 {
+    font-size: 21px;
+    font-weight: 700;
+    letter-spacing: 0.4px;
+    margin: 0;
+    background: linear-gradient(90deg, var(--her), var(--her2));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+  .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: #5a4a75; flex: none;
+  }
+  .dot.live {
+    background: #7dffb0; box-shadow: 0 0 8px #7dffb0;
+    animation: breathe 2.6s ease-in-out infinite;
+  }
+  @keyframes breathe { 50% { box-shadow: 0 0 14px #7dffb0; } }
+  .mood {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    padding: 4px 11px;
+    border-radius: 999px;
+    background: rgba(255,255,255,0.08);
+    border: 1px solid rgba(255,255,255,0.12);
+    color: rgba(246,236,255,0.85);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 34vw;
+  }
+  .mood i {
+    width: 7px; height: 7px; border-radius: 50%; flex: none;
+    background: var(--mood); box-shadow: 0 0 6px var(--mood);
+  }
+  header button {
+    margin-left: auto;
+    border: 1px solid rgba(255,255,255,0.25);
+    background: rgba(255,255,255,0.08);
+    color: var(--ink);
+    border-radius: 999px;
+    padding: 6px 12px;
+    font-size: 13px;
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+  }
+  header button.off { opacity: 0.45; }
+  header button:active { transform: scale(0.95); }
+  .eq { display: none; align-items: flex-end; gap: 2px; height: 10px; }
+  header button.speaking .eq { display: inline-flex; }
+  .eq i {
+    width: 2.5px; height: 4px; border-radius: 1px; background: currentColor;
+    animation: eq 0.9s ease-in-out infinite;
+  }
+  .eq i:nth-child(2) { animation-delay: 0.2s; }
+  .eq i:nth-child(3) { animation-delay: 0.45s; }
+  @keyframes eq { 50% { height: 11px; } }
+
+  #chat {
+    position: relative;
+    z-index: 1;
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 8px 14px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+  }
+  .row { display: flex; gap: 8px; align-items: flex-end; }
+  .row.mine { justify-content: flex-end; }
+  .avatar {
+    width: 26px; height: 26px; border-radius: 50%; flex: none;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 12px; font-weight: 700; color: #2a1240;
+    background: linear-gradient(135deg, var(--her), var(--her2));
+    box-shadow: 0 2px 8px rgba(180,140,255,0.35);
+  }
+  .col { display: flex; flex-direction: column; max-width: 78%; min-width: 0; }
+  .row.mine .col { align-items: flex-end; }
+  .bubble {
+    padding: 10px 14px;
+    border-radius: 18px;
+    line-height: 1.45;
+    font-size: 15px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    overflow-wrap: anywhere;
+    animation: pop 0.22s ease both;
+  }
+  @keyframes pop { from { opacity: 0; transform: translateY(8px) scale(0.98); } }
+  .bubble.her {
+    background: rgba(255,255,255,0.10);
+    border: 1px solid rgba(255,255,255,0.13);
+    border-bottom-left-radius: 6px;
+    cursor: pointer;
+  }
+  .bubble.her:active { background: rgba(255,255,255,0.16); }
+  .bubble.mine {
+    background: linear-gradient(135deg, var(--her), var(--her2));
+    color: #2a1240;
+    font-weight: 600;
+    border-bottom-right-radius: 6px;
+  }
+  .bubble.typing {
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.08);
+    color: transparent;
+    min-width: 66px;
+  }
+  .dots { display: inline-flex; gap: 4px; align-items: center; height: 14px; }
+  .dots i {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: rgba(246,236,255,0.55);
+    animation: bounce 1.2s ease-in-out infinite;
+  }
+  .dots i:nth-child(2) { animation-delay: 0.18s; }
+  .dots i:nth-child(3) { animation-delay: 0.36s; }
+  @keyframes bounce { 30% { transform: translateY(-4px); opacity: 0.9; } }
+  .time {
+    font-size: 10px;
+    opacity: 0.35;
+    margin-top: 3px;
+    padding: 0 4px;
+  }
+
+  #empty {
+    position: absolute;
+    inset: 0;
+    display: none;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 14px;
+    pointer-events: none;
+    opacity: 0.75;
+  }
+  #empty.show { display: flex; }
+  .ring {
+    width: 54px; height: 54px; border-radius: 50%;
+    border: 2px solid rgba(255,158,207,0.5);
+    animation: ring 2.2s ease-out infinite;
+  }
+  @keyframes ring {
+    0% { transform: scale(0.6); opacity: 0.9; }
+    100% { transform: scale(1.4); opacity: 0; }
+  }
+  #empty p { font-size: 14px; margin: 0; }
+
+  #jump {
+    position: fixed;
+    z-index: 3;
+    right: 16px;
+    bottom: calc(88px + env(safe-area-inset-bottom));
+    width: 42px; height: 42px;
+    border-radius: 50%;
+    border: 1px solid rgba(255,255,255,0.25);
+    background: rgba(36,21,64,0.85);
+    color: var(--ink);
+    font-size: 17px;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+  }
+  #jump.show { display: flex; }
+  #jump:active { transform: scale(0.92); }
+
+  #composer {
+    position: relative;
+    z-index: 2;
+    display: flex;
+    gap: 8px;
+    align-items: flex-end;
+    padding: 8px 12px calc(10px + env(safe-area-inset-bottom));
+  }
+  #text {
+    flex: 1;
+    min-height: 46px;
+    max-height: 120px;
+    border-radius: 23px;
+    border: 1px solid rgba(255,255,255,0.22);
+    background: rgba(255,255,255,0.08);
+    color: var(--ink);
+    padding: 12px 18px;
+    font-size: 16px;
+    font-family: inherit;
+    line-height: 1.35;
+    outline: none;
+    resize: none;
+    transition: border-color 0.15s, background 0.15s;
+  }
+  #text:focus { border-color: var(--her); background: rgba(255,255,255,0.11); }
+  #send {
+    width: 46px; height: 46px; flex: none;
+    border-radius: 50%;
+    border: none;
+    background: linear-gradient(135deg, var(--her), var(--her2));
+    color: #2a1240;
+    font-size: 19px;
+    font-weight: 700;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: transform 0.1s, opacity 0.15s;
+  }
+  #send:active { transform: scale(0.88); }
+  #send:disabled { opacity: 0.35; }
+
+  #gate {
+    position: fixed;
+    inset: 0;
+    z-index: 10;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 14px;
+    padding: 24px;
+    text-align: center;
+  }
+  #gate.open { display: none; }
+  .card {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 14px;
+    padding: 30px 26px;
+    border-radius: 26px;
+    background: rgba(255,255,255,0.07);
+    border: 1px solid rgba(255,255,255,0.14);
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+    box-shadow: 0 18px 60px rgba(0,0,0,0.45);
+    max-width: 340px;
+    width: 100%;
+  }
+  .card h2 {
+    margin: 0;
+    font-size: 24px;
+    background: linear-gradient(90deg, var(--her), var(--her2));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+  .card p {
+    margin: 0;
+    font-size: 14px;
+    opacity: 0.6;
+    line-height: 1.5;
+  }
+  #gate-key {
+    min-height: 46px;
+    width: 100%;
+    border-radius: 999px;
+    border: 1px solid rgba(255,255,255,0.22);
+    background: rgba(255,255,255,0.08);
+    color: var(--ink);
+    padding: 0 18px;
+    font-size: 16px;
+    outline: none;
+    text-align: center;
+  }
+  #gate-key:focus { border-color: var(--her); }
+  #gate-enter {
+    border: none;
+    border-radius: 999px;
+    background: linear-gradient(135deg, var(--her), var(--her2));
+    color: #2a1240;
+    font-size: 15px;
+    font-weight: 700;
+    padding: 11px 30px;
+  }
+  #gate-enter:active { transform: scale(0.95); }
+  #gate-msg { min-height: 18px; color: #ff8fb0; opacity: 0.9; font-size: 13px; margin: 0; }
+
+  #toast {
+    position: fixed;
+    z-index: 20;
+    left: 50%;
+    bottom: calc(96px + env(safe-area-inset-bottom));
+    transform: translateX(-50%) translateY(8px);
+    padding: 8px 16px;
+    border-radius: 999px;
+    background: rgba(36,21,64,0.92);
+    border: 1px solid rgba(255,255,255,0.18);
+    color: var(--ink);
+    font-size: 13px;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.2s, transform 0.2s;
+  }
+  #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+</style>
+</head>
+<body>
+<div class="bg" aria-hidden="true">
+  <i class="blob b1"></i><i class="blob b2"></i><i class="blob b3"></i>
+  <i class="stars"></i>
+</div>
+<header>
+  <div class="dot" id="presence"></div>
+  <h1>Kookie</h1>
+  <span class="mood" id="mood"><i></i><b>happy</b></span>
+  <button id="voice" class="off"><span class="label">voice</span>
+    <s class="eq" aria-hidden="true"><i></i><i></i><i></i></s>
+  </button>
+</header>
+<div id="chat" role="log" aria-live="polite"></div>
+<div id="empty"><div class="ring"></div><p>she is listening — say hi</p></div>
+<button id="jump" aria-label="jump to the newest">&#8595;</button>
+<form id="composer">
+  <textarea id="text" rows="1" placeholder="say something..."
+            enterkeyhint="send" aria-label="message"></textarea>
+  <button id="send" type="submit" aria-label="send">&#10148;</button>
+</form>
+
+<div id="gate">
+  <div class="card">
+    <h2>Kookie</h2>
+    <p id="gate-text">she only opens the door for people who have her key</p>
+    <input id="gate-key" type="text" placeholder="key"
+           enterkeyhint="go" autocomplete="off" autocapitalize="off"
+           spellcheck="false" aria-label="key">
+    <input id="gate-discord" type="text"
+           placeholder="your discord id or username"
+           enterkeyhint="go" autocomplete="off" autocapitalize="off"
+           spellcheck="false" aria-label="your discord id"
+           style="display:none">
+    <button id="gate-enter" type="button">enter</button>
+    <p id="gate-msg"></p>
+  </div>
+</div>
+<div id="toast" role="status"></div>
+
+<script>
+"use strict";
+
+const chat = document.getElementById("chat");
+const text = document.getElementById("text");
+const send = document.getElementById("send");
+const voiceBtn = document.getElementById("voice");
+const gate = document.getElementById("gate");
+const gateKey = document.getElementById("gate-key");
+const gateDiscord = document.getElementById("gate-discord");
+const gateMsg = document.getElementById("gate-msg");
+const empty = document.getElementById("empty");
+const jump = document.getElementById("jump");
+const toastEl = document.getElementById("toast");
+const moodEl = document.getElementById("mood");
+const presence = document.getElementById("presence");
+
+let state = "idle";
+let voiceOn = false;
+// The key a visitor needs. Kept for this tab only, so a
+// phone someone else picks up does not walk in on her.
+let key = sessionStorage.getItem("kookie-key") || "";
+// Set once the family key is in: the door then asks who
+// they are, and only an account she knows opens it.
+let discordRef = sessionStorage.getItem("kookie-discord") || "";
+let familyMode = false;
+// Set when the door answered without a key: her
+// website stands open, so the gate lets anybody
+// walk in and keeps the key field for family.
+let publicSite = false;
+// Her own key for this visitor, minted on the spot
+// when the door stands open: her API answers the
+// keys she hands out, so every visitor holds one.
+let keyPromise = null;
+
+function ensureKey() {
+  if (!keyPromise) {
+    keyPromise = fetch("/api/issue-key", { method: "POST" })
+      .then(function (res) {
+        return res.ok ? res.json() : null;
+      })
+      .then(function (data) {
+        keyPromise = null;
+        return data && data.key ? data.key : "";
+      })
+      .catch(function () {
+        keyPromise = null;
+        return "";
+      });
+  }
+  return keyPromise;
+}
+
+const MOOD_COLORS = {
+  happy: "#ffd76e", excited: "#ff9ecf", joyful: "#ff9ecf",
+  sad: "#8db4ff", angry: "#ff8f8f", furious: "#ff8f8f",
+  nervous: "#c9b8ff", worried: "#c9b8ff", surprised: "#c9b8ff",
+  embarrassed: "#ffb3d9", shy: "#ffb3d9", affectionate: "#ff9ecf",
+  calm: "#a8f0d1", sleepy: "#8db4ff", thinking: "#c9b8ff",
+  neutral: "#9fb0c9",
+};
+
+function scrollChat() {
+  chat.scrollTop = chat.scrollHeight;
+}
+
+function stamp() {
+  return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+function updateEmpty() {
+  empty.classList.toggle("show", !chat.children.length);
+}
+
+function addBubble(who, content) {
+  const row = document.createElement("div");
+  row.className = "row " + who;
+  if (who === "her" || who === "typing") {
+    const avatar = document.createElement("div");
+    avatar.className = "avatar";
+    avatar.textContent = "K";
+    row.appendChild(avatar);
+  }
+  const col = document.createElement("div");
+  col.className = "col";
+  const div = document.createElement("div");
+  div.className = "bubble " + who;
+  if (who === "typing") {
+    div.innerHTML = '<span class="dots"><i></i><i></i><i></i></span>';
+  } else {
+    div.textContent = content;
+  }
+  col.appendChild(div);
+  const time = document.createElement("div");
+  time.className = "time";
+  time.textContent = stamp();
+  col.appendChild(time);
+  row.appendChild(col);
+  chat.appendChild(row);
+  scrollChat();
+  updateEmpty();
+  return div;
+}
+
+function setMood(mood) {
+  const name = String(mood || "neutral").toLowerCase();
+  moodEl.style.setProperty("--mood", MOOD_COLORS[name] || "#7dffb0");
+  moodEl.querySelector("b").textContent = name;
+}
+
+function refreshMood() {
+  herFetch("/api/status")
+    .then(function (res) { return res.ok ? res.json() : null; })
+    .then(function (data) {
+      if (data && data.mood) setMood(data.mood);
+    })
+    .catch(function () {});
+}
+
+let toastTimer = null;
+function toast(message) {
+  toastEl.textContent = message;
+  toastEl.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(function () {
+    toastEl.classList.remove("show");
+  }, 1600);
+}
+
+function copyText(content) {
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(content)
+      .then(function () { toast("copied"); })
+      .catch(function () {});
+    return;
+  }
+  const ta = document.createElement("textarea");
+  ta.value = content;
+  ta.style.position = "fixed";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.select();
+  try {
+    document.execCommand("copy");
+    toast("copied");
+  } catch (e) { /* nowhere to copy to */ }
+  ta.remove();
+}
+
+function unlock() {
+  if (key) sessionStorage.setItem("kookie-key", key);
+  if (discordRef) {
+    sessionStorage.setItem("kookie-discord", discordRef);
+  }
+  gate.classList.add("open");
+  presence.classList.add("live");
+  setMood("happy");
+  refreshMood();
+  updateEmpty();
+}
+
+async function herFetch(path, options) {
+  options = options || {};
+  options.headers = Object.assign({}, options.headers || {});
+  if (publicSite && !key && !discordRef) {
+    // The API answers the keys she hands out, so
+    // this visitor asks for one of their own.
+    key = await ensureKey();
+  }
+  if (key) options.headers["X-Kookie-Key"] = key;
+  if (discordRef) options.headers["X-Kookie-Discord"] = discordRef;
+  return fetch(path, options);
+}
+
+// The door checks the key first. The family key only
+// says "I might be family" - it then asks who they
+// are, and only an account she knows opens it.
+async function askDoor() {
+  try {
+    const res = await herFetch("/api/whoami");
+    if (res.ok) return await res.json();
+  } catch (e) { /* she is not answering */ }
+  return null;
+}
+
+async function submitKey() {
+  const candidate = gateKey.value.trim();
+  if (!candidate) {
+    // Her website stands open: an empty key is a
+    // stranger walking in, not a key forgotten.
+    if (publicSite) {
+      // A key of her own comes with the walk-in,
+      // because her API answers her keys.
+      key = await ensureKey();
+      unlock();
+      text.focus();
+    }
+    return;
+  }
+  gateMsg.textContent = "";
+  key = candidate;
+  const info = await askDoor();
+  if (!info) {
+    key = "";
+    sessionStorage.removeItem("kookie-key");
+    gateMsg.textContent = "that is not her key";
+    gateKey.value = "";
+    return;
+  }
+  if (info.mode === "family") {
+    familyMode = true;
+    gateDiscord.style.display = "block";
+    gateDiscord.focus();
+    return;
+  }
+  unlock();
+  text.focus();
+}
+
+async function submitDiscord() {
+  const ref = gateDiscord.value.trim();
+  if (!ref) return;
+  gateMsg.textContent = "";
+  discordRef = ref;
+  const info = await askDoor();
+  if (info && info.family) {
+    unlock();
+    if (info.name) toast("she knows you as " + info.name);
+    text.focus();
+    return;
+  }
+  discordRef = "";
+  sessionStorage.removeItem("kookie-discord");
+  gateMsg.textContent = "she does not know that account";
+  gateDiscord.value = "";
+}
+
+document.getElementById("gate-enter").addEventListener(
+  "click", () => {
+    if (familyMode) submitDiscord();
+    else submitKey();
+  });
+gateKey.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    submitKey();
+  }
+});
+gateDiscord.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    submitDiscord();
+  }
+});
+
+function openWith(info) {
+  if (info.mode === "family") {
+    familyMode = true;
+    gateDiscord.style.display = "block";
+    if (discordRef) submitDiscord();
+    return;
+  }
+  if (key) {
+    // A key from an earlier visit that she still
+    // agrees with opens the door straight away.
+    unlock();
+    return;
+  }
+  publicSite = true;
+  document.getElementById("gate-text").textContent =
+    "anyone can talk to her. walk in by leaving the " +
+    "key empty, or enter the family key if she knows you";
+  gateKey.placeholder = "family key (optional)";
+}
+
+// Keys from an earlier visit on this tab still work,
+// but only if she still agrees with them. Her website
+// stands open unless the owner set a stranger key, so
+// the door is also asked without one: when it answers
+// anybody, the gate stays up with a walk-in door.
+askDoor().then(function (info) {
+  if (info) return openWith(info);
+  if (!key) return;
+  // A key from an earlier visit that she no longer
+  // agrees with - hers to take back. The door may
+  // still stand open for everybody else.
+  key = "";
+  discordRef = "";
+  sessionStorage.removeItem("kookie-key");
+  sessionStorage.removeItem("kookie-discord");
+  askDoor().then(openWith).catch(function () {
+    /* the door stays shut */
+  });
+}).catch(function () { /* the door stays shut */ });
+
+async function speak(reply) {
+  if (!voiceOn || !reply) return;
+  try {
+    const res = await herFetch(
+      "/api/tts?text=" + encodeURIComponent(reply));
+    if (!res.ok) return;
+    const blob = await res.blob();
+    const audio = new Audio(URL.createObjectURL(blob));
+    voiceBtn.classList.add("speaking");
+    audio.addEventListener("ended", function () {
+      voiceBtn.classList.remove("speaking");
+    });
+    await audio.play();
+  } catch (e) {
+    voiceBtn.classList.remove("speaking");
+  }
+}
+
+function grow() {
+  text.style.height = "auto";
+  text.style.height = Math.min(text.scrollHeight, 120) + "px";
+}
+
+async function sendMessage() {
+  const message = text.value.trim();
+  if (!message || state === "waiting") return;
+  if (publicSite && !key && !discordRef) {
+    // The walk-in already minted a key; this is
+    // the retry if that one did not come through.
+    key = await ensureKey();
+    if (!key) {
+      toast("she could not hand you a key - try again");
+      return;
+    }
+  }
+  text.value = "";
+  grow();
+  if (navigator.vibrate) navigator.vibrate(8);
+  addBubble("mine", message);
+  state = "waiting";
+  send.disabled = true;
+  const typing = addBubble("typing", "");
+  typing.addEventListener("click", function () {
+    copyText(typing.textContent);
+  });
+  try {
+    const res = await herFetch("/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message }),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    const { id } = await res.json();
+    // The voice stream cannot set a header, so the key
+    // rides along with the address instead.
+    const source = new EventSource(
+      "/api/chat/" + id
+      + "?key=" + encodeURIComponent(key)
+      + "&discord=" + encodeURIComponent(discordRef));
+    let full = "";
+    source.addEventListener("token", (event) => {
+      const data = JSON.parse(event.data);
+      full = data.text;
+      typing.textContent = full;
+      typing.className = "bubble her";
+    });
+    source.addEventListener("done", (event) => {
+      source.close();
+      const result = JSON.parse(event.data);
+      const reply = result.reply || full;
+      typing.textContent = reply;
+      typing.className = "bubble her";
+      state = "idle";
+      send.disabled = false;
+      setMood(result.emotion);
+      refreshMood();
+      speak(reply);
+    });
+    source.addEventListener("error", (event) => {
+      source.close();
+      typing.textContent = "My brain jammed on that one, Mommy.";
+      typing.className = "bubble her";
+      state = "idle";
+      send.disabled = false;
+    });
+  } catch (error) {
+    typing.textContent = "I could not reach my own head just now.";
+    typing.className = "bubble her";
+    state = "idle";
+    send.disabled = false;
+  }
+}
+
+text.addEventListener("input", grow);
+
+document.getElementById("composer").addEventListener("submit", (event) => {
+  event.preventDefault();
+  sendMessage();
+});
+
+text.addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && !event.shiftKey) {
+    event.preventDefault();
+    sendMessage();
+  }
+});
+
+chat.addEventListener("scroll", () => {
+  jump.classList.toggle(
+    "show",
+    chat.scrollTop + chat.clientHeight < chat.scrollHeight - 240
+  );
+});
+
+jump.addEventListener("click", () => {
+  chat.scrollTo({ top: chat.scrollHeight, behavior: "smooth" });
+});
+
+voiceBtn.addEventListener("click", () => {
+  voiceOn = !voiceOn;
+  voiceBtn.querySelector(".label").textContent =
+    voiceOn ? "voice on" : "voice off";
+  voiceBtn.classList.toggle("off", !voiceOn);
+});
+
+setInterval(() => {
+  if (key) refreshMood();
+}, 30000);
+</script>
+</body>
+</html>

@@ -1,0 +1,292 @@
+#!/usr/bin/env bash
+# Kookie - launch the local VTuber companion in her own terminal window.
+#
+#   ./Kookie                 start her window (Ctrl+C stops her)
+#   kookie --web             her website on a phone (any directory)
+#   ./Kookie --stop          stop a Kookie that is already running
+#   ./Kookie --status        show whether she is running
+#   ./Kookie --help          every option
+
+set -uo pipefail
+
+# Where this script really lives, whether it was run as
+# ./Kookie, as kookie from the PATH, or through a symlink
+# such as ~/.local/bin/kookie.
+SOURCE="${BASH_SOURCE[0]}"
+if [[ "$SOURCE" != */* ]]; then
+  SOURCE="$(command -v "$SOURCE")" || exit 1
+fi
+while [ -h "$SOURCE" ]; do
+  LINK_DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$LINK_DIR/$SOURCE"
+done
+DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+PYTHON="$DIR/.venv/bin/python"
+WINDOW="$DIR/kookie_ui.py"
+CLI="$DIR/controller.py"
+DISCORD="$DIR/discord_bot.py"
+WEB="$DIR/webui.py"
+PID_FILE="$DIR/.kookie.pid"
+PROBE_FILE="$DIR/.kookie_probe"
+# The same model controller.py thinks with, so the
+# startup probe below asks about the one that matters.
+OLLAMA_MODEL="${KOOKIE_MODEL:-qwen3:4b}"
+
+# Nobody sets this to a full endpoint on purpose: it is the address of the Ollama
+# server, so trim anything path-like back to it before building the endpoints
+# below. Without this a plain "http://host:11434" pings /api/tags/api/tags and
+# sends prompts to /api/generate/api/generate.
+#
+# The trimming also has to reach the python process. controller.py reads
+# KOOKIE_OLLAMA_URL itself and does the same trim, but the probe below has to
+# match what she will actually ask, so the trimmed base is exported rather than
+# recomputed here a second time.
+OLLAMA_BASE="${KOOKIE_OLLAMA_URL:-http://localhost:11434}"
+OLLAMA_BASE="${OLLAMA_BASE%/}"
+for OLLAMA_PATH in /api/generate /api/tags /api; do
+  case "$OLLAMA_BASE" in
+    *"$OLLAMA_PATH") OLLAMA_BASE="${OLLAMA_BASE%"$OLLAMA_PATH"}" ;;
+  esac
+done
+export OLLAMA_BASE
+OLLAMA_URL="$OLLAMA_BASE/api/tags"
+OLLAMA_GENERATE_URL="$OLLAMA_BASE/api/generate"
+
+START_ONLY=0
+STOP_ONLY=0
+STATUS_ONLY=0
+CLI_ONLY=0
+DISCORD_ONLY=0
+WEB_ONLY=0
+child_pid=""
+
+accent=$'\033[38;5;185m'
+dim=$'\033[2m'
+bold=$'\033[1m'
+red=$'\033[38;5;203m'
+reset=$'\033[0m'
+
+say()  { printf '%s\n' "$*"; }
+head1() { printf '%s\n' "${accent}${bold}kookie${reset} ${dim}· local vtuber companion${reset}"; }
+warn() { printf '%s\n' "${red}!${reset} $*"; }
+die()  { warn "$*"; exit 1; }
+
+usage() {
+  head1
+  say ""
+  say "  ${bold}./Kookie${reset} [options]   (or: ${bold}kookie${reset} [options])"
+  say ""
+  say "  --stop          stop the Kookie started by this script"
+  say "  --status        show whether she is running"
+  say "  --cli           plain text chat in this terminal, no full-screen window"
+  say "  --discord       run her as a Discord bot instead of a window"
+  say "  --web           her website, on this network or anywhere"
+  say "  --help          this message"
+  say ""
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --no-browser|--port|--host) die "$1 is not supported any more: Kookie runs in this terminal" ;;
+    --stop) STOP_ONLY=1; shift ;;
+    --status) STATUS_ONLY=1; shift ;;
+    --cli) CLI_ONLY=1; shift ;;
+    --discord) DISCORD_ONLY=1; shift ;;
+--web) WEB_ONLY=1; shift ;;
+    --help|-h) usage; exit 0 ;;
+    *) die "unknown option: $1  (try --help)" ;;
+  esac
+done
+
+# One bot, always. A second Kookie means every message answered twice, two
+# processes writing mood.json, and a prompt cache that thrashes, so this is
+# checked by the script name as well as by the pid file: a launcher that was
+# killed without running its trap takes the pid file with it and leaves her
+# python running, and the pid file is then the only thing standing between a
+# clean --stop and a second copy of her answering in the same channel.
+discord_pid() {
+  pgrep -f "[p]ython.*${DISCORD}" 2>/dev/null | head -1
+}
+
+web_pid() {
+  pgrep -f "[p]ython.*${WEB}" 2>/dev/null | head -1
+}
+
+running_pid() {
+  local pid
+  if [ -f "$PID_FILE" ]; then
+    pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      printf '%s' "$pid"
+      return 0
+    fi
+  fi
+  # No usable pid file, so she is found by what she is running. This is what
+  # makes --stop work on a Kookie whose launcher is gone.
+  if [ -f "$DISCORD" ]; then
+    pid="$(discord_pid)"
+    if [ -n "$pid" ]; then
+      printf '%s' "$pid"
+      return 0
+    fi
+  fi
+  if [ -f "$WEB" ]; then
+    pid="$(web_pid)"
+    if [ -n "$pid" ]; then
+      printf '%s' "$pid"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+stop_running() {
+  local pid
+  pid="$(running_pid)" || return 1
+  rm -f "$PID_FILE"
+  kill -TERM "$pid" 2>/dev/null
+  for _ in $(seq 1 40); do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.25
+  done
+  kill -KILL "$pid" 2>/dev/null
+  return 0
+}
+
+stop_child() {
+  # Same escalation for her python, used when this script is the one being torn
+  # down (Ctrl+C, a closed terminal): she must not outlive it as an orphan.
+  [ -n "$child_pid" ] || return 0
+  kill -0 "$child_pid" 2>/dev/null || return 0
+  kill -TERM "$child_pid" 2>/dev/null
+  for _ in $(seq 1 40); do
+    kill -0 "$child_pid" 2>/dev/null || return 0
+    sleep 0.25
+  done
+  kill -KILL "$child_pid" 2>/dev/null
+  return 0
+}
+
+run_kookie() {
+  # Start her in the background and record the python child, never this shell:
+  # bash defers a trapped signal while a foreground child runs, so a --stop aimed
+  # at $$ was only handled once she had already quit - and the window was left
+  # running with no pid file to find it by.
+  #
+  # trap - INT QUIT matters here: a background child of a script inherits SIGINT
+  # and SIGQUIT as ignored, which would leave Ctrl+C in this terminal doing
+  # nothing at all. exec then keeps the subshell's pid, so $! really is hers.
+  # Unbuffered, so the log says what she is doing while she is doing it. Her
+  # output goes to a file rather than a terminal, where python buffers it in 4 KB
+  # blocks: with a quiet channel nothing appears for minutes, and "the log is
+  # empty" is indistinguishable from "she is stuck" when what you are trying to
+  # see is whether she answered.
+  ( trap - INT QUIT; TERM="${TERM:-xterm-256color}" PYTHONUNBUFFERED=1 \
+      exec "$PYTHON" "$1" ) &
+  child_pid=$!
+  printf '%s\n' "$child_pid" > "$PID_FILE"
+  wait "$child_pid"
+}
+
+if [ "$STOP_ONLY" -eq 1 ]; then
+  if stop_running; then say "Kookie stopped."; else say "Kookie was not running."; fi
+  exit 0
+fi
+
+if [ "$STATUS_ONLY" -eq 1 ]; then
+  if pid="$(running_pid)"; then
+    say "Kookie is running (pid $pid)."
+  else
+    say "Kookie is not running."
+  fi
+  # The backgrounded model probe has nowhere safe to print once her window owns
+  # the terminal, so it leaves its verdict here for --status to show.
+  if [ -s "$PROBE_FILE" ]; then
+    while IFS= read -r line; do warn "$line"; done < "$PROBE_FILE"
+  fi
+  exit 0
+fi
+
+[ -x "$PYTHON" ] || die "no python at $PYTHON  (create the venv first)"
+[ -f "$WINDOW" ] || die "missing $WINDOW"
+
+if pid="$(running_pid)"; then
+  die "Kookie is already running (pid $pid).  Use './Kookie --stop' first."
+fi
+
+head1
+
+# A verdict from an earlier launch says nothing about this one.
+rm -f "$PROBE_FILE"
+
+if ! curl -fsS --max-time 2 "$OLLAMA_URL" >/dev/null 2>&1; then
+  warn "Ollama is not answering on ${OLLAMA_URL} - she will not be able to think yet."
+  warn "Start it with:  ollama serve"
+else
+  # The server answers /api/tags happily even when its model runner is dead or out
+  # of memory, so a ping alone lets her start looking fine and then hang on every
+  # message. Ask for one real token instead - in the background, because a cold
+  # 2 GB load on a small machine is slow and she should not wait on it to wake up.
+  # keep_alive 0 hands the weights straight back: this is a question about whether
+  # Ollama can think, not a reason to hold 2 GB of model in memory for five
+  # minutes. It was pinning a second model next to the one she actually uses,
+  # which on a 7.6 GB box left 142 MB free and turned every reply into swap.
+  (
+    if ! curl -fsS --max-time 45 "$OLLAMA_GENERATE_URL" \
+          -d "{\"model\":\"$OLLAMA_MODEL\",\"prompt\":\"hi\",\"stream\":false,\"keep_alive\":0,\"options\":{\"num_predict\":1,\"num_ctx\":512}}" \
+          >/dev/null 2>&1; then
+      {
+        printf '%s\n' "Ollama is up but ${OLLAMA_MODEL} will not run a token - Kookie cannot think yet."
+        printf '%s\n' "Restart Ollama where it runs (its runner is usually out of memory)."
+      } > "$PROBE_FILE.tmp" && mv -f "$PROBE_FILE.tmp" "$PROBE_FILE"
+    fi
+  ) &
+fi
+
+# On Discord she is in a channel rather than a window, so there is no face and no
+# terminal to hand over. Same checks as CLI mode, same Ctrl+C to stop.
+if [ "$DISCORD_ONLY" -eq 1 ]; then
+  [ -f "$DISCORD" ] || die "missing $DISCORD"
+  # Refuse a second one even when the pid file says there is none, because that
+  # combination is exactly the duplicate-bot case: a bot running, a pid file that
+  # does not know about it, and someone starting her again.
+  if [ "$STATUS_ONLY" -ne 1 ] && [ -n "$(discord_pid)" ]; then
+    die "the discord bot is already running (pid $(discord_pid)).  Use './Kookie --stop' first."
+  fi
+  say "  ${dim}discord bot · press Ctrl+C to stop${reset}"
+  say ""
+  trap 'rm -f "$PID_FILE"; stop_child' INT TERM HUP EXIT
+  run_kookie "$DISCORD"
+  exit $?
+fi
+
+# On the web she lives in a phone's browser, so there is
+# no window to open; the server prints the address to
+# visit instead. Same checks, same Ctrl+C to stop.
+if [ "$WEB_ONLY" -eq 1 ]; then
+  [ -f "$WEB" ] || die "missing $WEB"
+  say "  ${dim}her website · press Ctrl+C to stop${reset}"
+  say ""
+  trap 'rm -f "$PID_FILE"; stop_child' INT TERM HUP EXIT
+  run_kookie "$WEB"
+  exit $?
+fi
+
+# In CLI mode she talks in this terminal, so take it over instead of her window.
+if [ "$CLI_ONLY" -eq 1 ]; then
+  [ -f "$CLI" ] || die "missing $CLI"
+  say "  ${dim}plain chat · press Ctrl+C or type /quit to stop${reset}"
+  say ""
+  trap 'rm -f "$PID_FILE"; stop_child' INT TERM HUP EXIT
+  run_kookie "$CLI"
+  exit $?
+fi
+
+say "  ${dim}starting her window · press Ctrl+C to stop${reset}"
+say ""
+
+trap 'rm -f "$PID_FILE"; stop_child' INT TERM HUP EXIT
+
+run_kookie "$WINDOW"
+exit $?

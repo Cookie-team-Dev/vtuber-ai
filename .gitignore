@@ -1,0 +1,64 @@
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local conversation and private credentials
+memory.json
+mood.json
+persona.json
+kookie_knowledge.json
+kookie_people.json
+# The corpus and the dataset exported from it are made of the same private
+# conversations as memory.json, so they are kept off git for the same reason.
+kookie_learning.json
+kookie_training_data.jsonl
+vts_token.txt
+app_token.txt
+.env
+.env.*
+
+# Large local voice and phonemizer models
+*.onnx
+*.onnx.json
+
+# Downloaded perception models: the faster-whisper cache and the
+# vosk model are large and re-downloadable, so they stay off git
+# (YuNet's .onnx is already covered by *.onnx above).
+models/models--*/
+models/blobs/
+models/.locks/
+models/CACHEDIR.TAG
+models/vosk-model-small-en-us-0.15/
+
+# Faces she was taught and the character list are private:
+# they are pictures of real people and her own knowledge.
+models/faces/
+models/characters.txt
+
+# Browser downloads and generated files
+playwright-report/
+test-results/
+*.wav
+*.log
+
+# Historical local backups
+controller.py.save
+controller_backup*.py
+controller_broken_backup.py
+.kilo_code_hash_cache
+
+# Kookie local settings
+kookie_settings.json
+# Keys her website mints for its visitors
+web/web_keys.json
+
+# Kookie launcher state
+.kookie.pid
+.kookie_probe
+# Left behind only if a memory compaction was killed mid-write
+memory_journal.log.compacting
