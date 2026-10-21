@@ -1,5 +1,6 @@
 import json
 import math
+import logging
 import os
 import threading
 import time
@@ -38,21 +39,6 @@ def _contains_slur(text):
     lowered = str(text).lower()
     return any(word in lowered for word in _SLUR_WORDS)
 
-
-def _scrub_slurs(text):
-    """Replace any slur in a note with a marker, for display only.
-
-    Storage never happens through this path - notes that contain a slur are
-    refused outright. This exists so a note that is being shown to somebody
-    does not leak the word while explaining why it was refused.
-    """
-    if not text:
-        return text
-    out = str(text)
-    for word in _SLUR_WORDS:
-        out = out.replace(word, "[slur]")
-        out = out.replace(word.capitalize(), "[slur]")
-    return out
 # The journal is consumed by renaming it to this name before memory.json is
 # replaced. Anything left under the name is either already in memory.json (a
 # compaction that got that far) or still missing from it (one that died before),
@@ -228,6 +214,14 @@ def _write_json_atomic(path, data):
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp_path, path)
+    try:
+        dirfd = os.open(os.path.dirname(os.path.abspath(path)) or ".", os.O_RDONLY)
+        try:
+            os.fsync(dirfd)
+        finally:
+            os.close(dirfd)
+    except OSError:
+        pass
 
 
 _MEMORY_LOCK = threading.RLock()
@@ -276,16 +270,10 @@ def _write_all(entries):
             # means clearing the journal first, then calling save_memory.
             pending_path = _pending_journal_path(journal_path)
             # Consume the journal with a rename, before memory.json is rewritten.
-            # A note appended after the rename lands in a brand new journal file
-            # that the next read still sees, and one written just before it is in
-            # the renamed file that is read below - so neither can be swallowed by
-            # the drop that follows. Nothing is destroyed until memory.json holds
-            # every note: a crash in between leaves them in the pending file, and
-            # if it dies earlier still the journal is simply untouched. The pending
-            # file is also where an earlier interrupted compaction left notes that
-            # memory.json does not have yet.
-            if os.path.exists(journal_path):
+            try:
                 os.replace(journal_path, pending_path)
+            except OSError:
+                pass
             merged = _merge_notes(entries, _parse_journal(pending_path))
             if len(merged) > MAX_MEMORY_ENTRIES:
                 merged = merged[-MAX_MEMORY_ENTRIES:]
@@ -315,7 +303,14 @@ def load_memory():
 
 
 def save_memory(memory):
-    entries = [entry for entry in (_normalise_entry(item) for item in memory) if entry]
+    entries = []
+    for item in memory:
+        entry = _normalise_entry(item)
+        if not entry:
+            continue
+        if _contains_slur(entry.get("text", "")):
+            continue
+        entries.append(entry)
     _write_all(entries)
 
 
@@ -328,9 +323,11 @@ def remember(text):
     something she keeps in her head, and it never goes back into a prompt.
     """
     if _contains_slur(text):
-        print("memory: refused to store a note containing a slur")
+        logging.warning("memory: refused to store a note containing a slur")
         return False
     memory_path, journal_path = _memory_paths()
+    if not isinstance(text, str):
+        return False
     entry = {"text": text, "time": time.time()}
     full_rewrite = None
     with _MEMORY_LOCK:
@@ -339,7 +336,7 @@ def remember(text):
         try:
             with open(journal_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        except OSError:
+        except (OSError, TypeError):
             full_rewrite = list(entries)
         else:
             global _MEMORY_CACHE_STAMP
@@ -429,6 +426,10 @@ def get_mood_state(now=None):
         mood = "neutral"
         intensity = MOOD_BASELINE_INTENSITY
         updated_at = now
+        try:
+            _write_json_atomic(MOOD_FILE, {"mood": mood, "intensity": intensity, "updated_at": updated_at})
+        except OSError:
+            pass
     # Clamp before the cache, not only on the way out: the cached branch decayed
     # the stored value, so an unclamped intensity read from a hand-edited
     # mood.json came back clamped on the first call and larger on the next one
@@ -450,7 +451,10 @@ def save_mood_state(mood, intensity):
     global _MOOD_CACHE, _MOOD_CACHE_TIME
     if mood not in MOOD_NAMES:
         mood = "neutral"
-    intensity = float(intensity)
+    try:
+        intensity = float(intensity)
+    except (TypeError, ValueError):
+        intensity = MOOD_BASELINE_INTENSITY
     if not math.isfinite(intensity):
         intensity = MOOD_BASELINE_INTENSITY
     state = {
@@ -476,28 +480,37 @@ def get_persona_state():
             stored = json.load(f)
         if not isinstance(stored, dict):
             raise ValueError("Invalid persona state")
+        persona = {}
+        for field, defaults in DEFAULT_PERSONA.items():
+            if not isinstance(defaults, list):
+                persona[field] = stored.get(field, defaults)
+                continue
+            values = stored.get(field, defaults)
+            if not isinstance(values, list):
+                values = defaults
+            persona[field] = [
+                item for item in values
+                if isinstance(item, str) or (
+                    isinstance(item, dict)
+                    and isinstance(item.get("text"), str)
+                    and isinstance(item.get("evidence"), str)
+                )
+            ][:12]
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
-        stored = {}
+        persona = {}
+        for field, defaults in DEFAULT_PERSONA.items():
+            if isinstance(defaults, list):
+                persona[field] = list(defaults)
+            else:
+                persona[field] = defaults
+        try:
+            _write_json_atomic(PERSONA_FILE, persona)
+        except OSError:
+            pass
 
-    persona = {}
-    for field, defaults in DEFAULT_PERSONA.items():
-        if not isinstance(defaults, list):
-            persona[field] = stored.get(field, defaults)
-            continue
-        values = stored.get(field, defaults)
-        if not isinstance(values, list):
-            values = defaults
-        persona[field] = [
-            item for item in values
-            if isinstance(item, str) or (
-                isinstance(item, dict)
-                and isinstance(item.get("text"), str)
-                and isinstance(item.get("evidence"), str)
-            )
-        ][:12]
     with _MEMORY_LOCK:
         _PERSONA_CACHE = persona.copy()
-        _PERSONA_CACHE_STAMP = stamp
+        _PERSONA_CACHE_STAMP = _file_stamp(PERSONA_FILE)
     return persona.copy()
 
 
@@ -519,19 +532,57 @@ def learn_persona_detail(update, user_message):
     if evidence.casefold() not in user_message.casefold():
         return False
 
-    persona = get_persona_state()
-    entries = persona[field]
-    normalized_value = value.casefold()
-    if any(
-        (entry if isinstance(entry, str) else entry["text"]).casefold() == normalized_value
-        for entry in entries
-    ):
-        return False
-    entries.append({"text": value, "evidence": evidence})
-    persona[field] = entries[-12:]
-    _write_json_atomic(PERSONA_FILE, persona)
     global _PERSONA_CACHE, _PERSONA_CACHE_STAMP
     with _MEMORY_LOCK:
+        stamp = _file_stamp(PERSONA_FILE)
+        if _PERSONA_CACHE is not None and _PERSONA_CACHE_STAMP == stamp:
+            persona = _PERSONA_CACHE.copy()
+        else:
+            try:
+                with open(PERSONA_FILE, "r", encoding="utf-8") as f:
+                    stored = json.load(f)
+                if not isinstance(stored, dict):
+                    raise ValueError("Invalid persona state")
+                persona = {}
+                for ffield, defaults in DEFAULT_PERSONA.items():
+                    if not isinstance(defaults, list):
+                        persona[ffield] = stored.get(ffield, defaults)
+                        continue
+                    values = stored.get(ffield, defaults)
+                    if not isinstance(values, list):
+                        values = defaults
+                    persona[ffield] = [
+                        item for item in values
+                        if isinstance(item, str) or (
+                            isinstance(item, dict)
+                            and isinstance(item.get("text"), str)
+                            and isinstance(item.get("evidence"), str)
+                        )
+                    ][:12]
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                persona = {}
+                for ffield, defaults in DEFAULT_PERSONA.items():
+                    if isinstance(defaults, list):
+                        persona[ffield] = list(defaults)
+                    else:
+                        persona[ffield] = defaults
+                try:
+                    _write_json_atomic(PERSONA_FILE, persona)
+                except OSError:
+                    pass
+
+        entries = persona.get(field, [])
+        if not isinstance(entries, list):
+            entries = []
+        normalized_value = value.casefold()
+        if any(
+            (entry if isinstance(entry, str) else entry.get("text", "")).casefold() == normalized_value
+            for entry in entries
+        ):
+            return False
+        entries.append({"text": value, "evidence": evidence})
+        persona[field] = entries[-12:]
+        _write_json_atomic(PERSONA_FILE, persona)
         _PERSONA_CACHE = persona.copy()
         _PERSONA_CACHE_STAMP = _file_stamp(PERSONA_FILE)
     return True

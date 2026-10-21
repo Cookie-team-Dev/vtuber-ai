@@ -6,11 +6,17 @@ has to land on, stretched to the length of that note and given a little
 vibrato so it reads as singing instead of a slowed-down voice.
 """
 
+import functools
 import math
 import re
 import time
 
-import numpy as np
+try:
+    import numpy as np
+    NUMPY_OK = True
+except Exception:
+    np = None
+    NUMPY_OK = False
 
 import songs
 
@@ -24,6 +30,25 @@ MAX_NOTES = 160
 DEFAULT_BUDGET_SECONDS = 120.0
 MIN_SLOT_SECONDS = 0.16
 MAX_SLOT_SECONDS = 1.6
+
+# A shift past these bounds stops sounding like a note and starts sounding like
+# an artifact, so the ratio is held inside them.
+MIN_PITCH_RATIO = 0.25
+MAX_PITCH_RATIO = 4.0
+
+
+def _needs_numpy(func):
+    """Fail with a clear message when a singing step needs numpy and it is gone."""
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        if not NUMPY_OK:
+            raise RuntimeError(
+                "numpy is needed to render singing but it is not installed; "
+                "install it with 'pip install numpy'."
+            )
+        return func(*args, **kwargs)
+    return wrapper
+
 
 # Each tune is (semitones from the base note, length in beats). The melodies are
 # deliberately pentatonic so any syllable can land on any note and still sound
@@ -415,6 +440,7 @@ HOW TO SING A LINE
 MAX_SHIFT_SEMITONES = 7.0
 
 
+@_needs_numpy
 def estimate_f0(samples, sample_rate=DEFAULT_SAMPLE_RATE, low_hz=90.0, high_hz=400.0):
     """Strongest spectral peak inside a band.
 
@@ -456,6 +482,7 @@ def note_pitch(samples, semitone, sample_rate=DEFAULT_SAMPLE_RATE):
 _VOICE_BASE_HZ = None
 
 
+@_needs_numpy
 def voice_base_hz(synth, sample_rate=DEFAULT_SAMPLE_RATE):
     """Find Piper's natural pitch once, so a melody lands on real notes.
 
@@ -526,7 +553,16 @@ def _psola_shift(samples, ratio, period):
     synthesis periods long and Hann-windowed, which is what keeps the sum from
     dipping between pulses.
     """
-    synthesis_period = period / max(1e-3, float(ratio))
+    ratio = float(ratio)
+    if not math.isfinite(ratio):
+        ratio = 1.0
+    # A shift past these bounds is not a note any more, it is an artifact, so
+    # the request is held inside them.
+    ratio = max(MIN_PITCH_RATIO, min(MAX_PITCH_RATIO, ratio))
+    period = float(period)
+    if not math.isfinite(period) or period <= 0.0:
+        return None
+    synthesis_period = period / max(1e-3, ratio)
     half = max(2, int(round(synthesis_period / 2.0)))
     grain_length = 2 * half
     marks = _pitch_marks(samples, period)
@@ -569,42 +605,77 @@ def _measure_period(samples, sample_rate, prior_hz):
     first and the caller's estimate is only a fallback for a fragment too
     short to measure.
     """
-    window = samples[:8192] if samples.size > 8192 else samples
-    if window.size >= 1024:
-        centred = window.astype(np.float64) - float(window.mean())
+    try:
+        rate = float(sample_rate)
+    except (TypeError, ValueError):
+        rate = DEFAULT_SAMPLE_RATE
+    if not math.isfinite(rate) or rate <= 0.0:
+        rate = DEFAULT_SAMPLE_RATE
+    try:
+        guess = float(prior_hz)
+    except (TypeError, ValueError):
+        guess = 0.0
+    fallback = rate / max(60.0, min(500.0, guess or FALLBACK_BASE_HZ))
+
+    count = int(getattr(samples, "size", 0))
+    if count < 1024:
+        return fallback
+    window = samples[:8192] if count > 8192 else samples
+    try:
+        centred = np.asarray(window, dtype=np.float64) - float(np.mean(window))
+    except (TypeError, ValueError):
+        return fallback
+    if centred.size < 1024:
+        return fallback
+    try:
         size = 1 << int(np.ceil(np.log2(2 * centred.size)))
         spectrum = np.fft.rfft(centred, size)
         correlation = np.fft.irfft(spectrum * np.conj(spectrum), size)[: centred.size]
-        energy = float(correlation[0])
-        if energy > 0.0:
-            correlation = correlation / energy
-            low = max(2, int(sample_rate / 400.0))
-            high = min(correlation.size - 1, int(sample_rate / 90.0))
-            if high > low:
-                lag = int(np.argmax(correlation[low:high])) + low
-                # Only a clear peak is trusted: a weak one is the autocorrelation
-                # of an unvoiced consonant, and trusting it detunes the note.
-                if correlation[lag] > 0.3:
-                    return float(lag)
-    return sample_rate / max(60.0, min(500.0, float(prior_hz) or FALLBACK_BASE_HZ))
+    except (TypeError, ValueError, FloatingPointError, MemoryError):
+        return fallback
+
+    energy = float(correlation[0])
+    if not math.isfinite(energy) or energy <= 0.0:
+        return fallback
+    correlation = correlation / energy
+    low = max(2, int(rate / 400.0))
+    high = min(correlation.size - 1, int(rate / 90.0))
+    if high <= low or low >= correlation.size:
+        return fallback
+    lag = int(np.argmax(correlation[low:high])) + low
+    # Only a clear peak is trusted: a weak one is the autocorrelation of an
+    # unvoiced consonant, and trusting it detunes the note.
+    if not math.isfinite(float(correlation[lag])) or correlation[lag] <= 0.3:
+        return fallback
+    return float(lag)
 
 
+@_needs_numpy
 def pitch_shift(samples, ratio, sample_rate=DEFAULT_SAMPLE_RATE, f0_hz=0.0):
     """Move a fragment onto its note without dragging its voice along with it."""
-    if samples.size == 0 or abs(ratio - 1.0) < 1e-3:
+    try:
+        shift = float(ratio)
+    except (TypeError, ValueError):
         return samples
+    if not math.isfinite(shift):
+        return samples
+    if samples.size == 0 or abs(shift - 1.0) < 1e-3:
+        return samples
+    # The same bound the PSOLA shift uses, so the resample fallback below
+    # cannot stretch a fragment to an absurd length either.
+    shift = max(MIN_PITCH_RATIO, min(MAX_PITCH_RATIO, shift))
     period = _measure_period(samples, sample_rate, f0_hz)
     shifted = None
     if samples.size > int(period * 3):
         try:
-            shifted = _psola_shift(samples, ratio, period)
+            shifted = _psola_shift(samples, shift, period)
         except (ValueError, IndexError, MemoryError):
             shifted = None
     if shifted is None or shifted.size == 0:
         # Too short to find a glottal cycle in, which is most one-syllable
         # fragments. Resampling keeps the note right and the voice wrong, which
         # still beats dropping the syllable.
-        return _resample_to(samples, samples.size / ratio)
+        return _resample_to(samples, samples.size / shift)
     return shifted.astype(np.float32)
 
 
@@ -640,6 +711,7 @@ def _fit_length(text, slot_seconds, target_hz, synth, sample_rate, base_hz):
     return fragment, measured_hz, length_scale
 
 
+@_needs_numpy
 def add_vibrato(samples, sample_rate, rate_hz=5.0, depth_semitones=0.25):
     """Modulate pitch with a slow sine so held notes sound sung.
 
@@ -663,6 +735,7 @@ def add_vibrato(samples, sample_rate, rate_hz=5.0, depth_semitones=0.25):
     return np.interp(read_positions, np.arange(samples.size, dtype=np.float64), samples).astype(np.float32)
 
 
+@_needs_numpy
 def add_breath(samples, sample_rate, seconds=0.09):
     """A short noisy onset before a phrase, so a line starts like a singer.
 
@@ -684,6 +757,7 @@ def add_breath(samples, sample_rate, seconds=0.09):
     return shaped.astype(np.float32)
 
 
+@_needs_numpy
 def fade_edges(samples, sample_rate, attack=0.02, release=0.05):
     """Short fades so note edges do not click."""
     if samples.size == 0:
@@ -698,6 +772,7 @@ def fade_edges(samples, sample_rate, attack=0.02, release=0.05):
     return shaped
 
 
+@_needs_numpy
 def trim_silence(samples, sample_rate, threshold=0.02):
     """Drop the quiet head and tail Piper pads onto every fragment."""
     if samples.size == 0:
@@ -721,6 +796,7 @@ def trim_silence(samples, sample_rate, threshold=0.02):
     return samples[start:min(end, samples.size)]
 
 
+@_needs_numpy
 def normalize(samples, peak=0.92):
     loudest = float(np.max(np.abs(samples))) if samples.size else 0.0
     if loudest <= 1e-6:
@@ -728,6 +804,7 @@ def normalize(samples, peak=0.92):
     return (samples * (peak / loudest)).astype(np.float32)
 
 
+@_needs_numpy
 def join_notes(previous, following, sample_rate, seconds=0.018):
     """Overlap two notes so a line flows instead of stopping between words.
 
@@ -748,6 +825,7 @@ def join_notes(previous, following, sample_rate, seconds=0.018):
     return np.concatenate([welded, following[overlap:]]).astype(np.float32)
 
 
+@_needs_numpy
 def render_note(text, semitone, slot_seconds, synth, sample_rate, tune, base_hz=None, legato=False):
     """Synthesise one fragment and bend it onto its note.
 
@@ -787,6 +865,7 @@ def render_note(text, semitone, slot_seconds, synth, sample_rate, tune, base_hz=
     return shifted, sample_rate
 
 
+@_needs_numpy
 def render_song(
     lines,
     synth,

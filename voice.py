@@ -1,4 +1,5 @@
 import io
+import logging
 import os
 import re
 import shutil
@@ -10,8 +11,29 @@ import time
 import wave
 from pathlib import Path
 
+log = logging.getLogger(__name__)
+
 VOICE_MODEL = Path(__file__).resolve().with_name("en_US-amy-medium.onnx")
 VOICE_ENABLED = True
+
+try:
+    from piper import PiperVoice, SynthesisConfig
+    PIPER_AVAILABLE = True
+except Exception:
+    PiperVoice = None
+    SynthesisConfig = None
+    PIPER_AVAILABLE = False
+
+try:
+    import numpy as np
+    NUMPY_OK = True
+except Exception:
+    np = None
+    NUMPY_OK = False
+
+if not VOICE_MODEL.exists():
+    VOICE_ENABLED = False
+    log.warning("Voice model %s not found; voice disabled.", VOICE_MODEL)
 
 _STAGE_DIRECTION_PATTERN = re.compile(r"\*[^*]*\*")
 _EMOJI_PATTERN = re.compile(
@@ -27,6 +49,15 @@ _EMOJI_PATTERN = re.compile(
     flags=re.UNICODE,
 )
 _DECORATION_PATTERN = re.compile(r"[~`^_=+<>|]+")
+_CODE_FENCE_PATTERN = re.compile(r"```[\s\S]*?```")
+_BOLD_PATTERN = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
+_UNDERLINE_PATTERN = re.compile(r"__(.+?)__", re.DOTALL)
+_STRIKETHROUGH_PATTERN = re.compile(r"~~(.+?)~~", re.DOTALL)
+_BACKTICK_PATTERN = re.compile(r"`(.+?)`", re.DOTALL)
+_HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
+_URL_PATTERN = re.compile(r"https?://\S+")
+_HEADING_PATTERN = re.compile(r"^\s*#{1,6}\s*", flags=re.MULTILINE)
+_BLOCKQUOTE_PATTERN = re.compile(r"^\s*>\s*", flags=re.MULTILINE)
 
 
 def sanitize_for_speech(text):
@@ -35,9 +66,18 @@ def sanitize_for_speech(text):
         return ""
     cleaned = _STAGE_DIRECTION_PATTERN.sub(" ", text)
     cleaned = _EMOJI_PATTERN.sub(" ", cleaned)
-    cleaned = _DECORATION_PATTERN.sub(" ", cleaned)
+    cleaned = _CODE_FENCE_PATTERN.sub(" ", cleaned)
+    cleaned = _BOLD_PATTERN.sub(r"\1", cleaned)
+    cleaned = _UNDERLINE_PATTERN.sub(r"\1", cleaned)
+    cleaned = _STRIKETHROUGH_PATTERN.sub(r"\1", cleaned)
+    cleaned = _BACKTICK_PATTERN.sub(r"\1", cleaned)
+    cleaned = _HTML_TAG_PATTERN.sub(" ", cleaned)
+    cleaned = _URL_PATTERN.sub(" ", cleaned)
+    cleaned = _HEADING_PATTERN.sub("", cleaned)
+    cleaned = _BLOCKQUOTE_PATTERN.sub("", cleaned)
     cleaned = re.sub(r"\[([^\]]*)\]", r"\1", cleaned)
     cleaned = re.sub(r"\(([^)]*)\)", r"\1", cleaned)
+    cleaned = _DECORATION_PATTERN.sub(" ", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned)
     return cleaned.strip()
 
@@ -99,12 +139,15 @@ def _piper_voice():
     every single time; holding it in this process costs that once.
     """
     global _PIPER_VOICE
+    if not PIPER_AVAILABLE:
+        return None
     if _PIPER_VOICE is None:
         with _PIPER_LOCK:
             if _PIPER_VOICE is None:
-                from piper import PiperVoice
-
-                _PIPER_VOICE = PiperVoice.load(str(VOICE_MODEL))
+                try:
+                    _PIPER_VOICE = PiperVoice.load(str(VOICE_MODEL))
+                except Exception:
+                    return None
     return _PIPER_VOICE
 
 
@@ -119,9 +162,11 @@ def warm_up():
 
 def _synthesize_with_piper(text, wav_path, length_scale):
     """Synthesise in-process. Raises if the in-process API is unavailable."""
-    from piper import SynthesisConfig
-
+    if not PIPER_AVAILABLE:
+        raise ModuleNotFoundError("piper module not installed")
     voice = _piper_voice()
+    if voice is None:
+        raise RuntimeError("piper voice unavailable")
     with wave.open(wav_path, "wb") as wav_file:
         voice.synthesize_wav(
             text, wav_file, syn_config=SynthesisConfig(length_scale=length_scale)
@@ -129,6 +174,10 @@ def _synthesize_with_piper(text, wav_path, length_scale):
 
 
 def _synthesize_with_cli(text, wav_path, length_scale):
+    if not PIPER_AVAILABLE:
+        raise ModuleNotFoundError("piper module not installed")
+    if not VOICE_MODEL.exists():
+        raise FileNotFoundError(f"Voice model not found: {VOICE_MODEL}")
     subprocess.run(
         [
             sys.executable,
@@ -147,6 +196,7 @@ def _synthesize_with_cli(text, wav_path, length_scale):
         capture_output=True,
         check=True,
         timeout=30,
+        start_new_session=True,
     )
 
 
@@ -166,8 +216,6 @@ def speak(text, emotion="neutral", intensity=0.5):
     length_scale = 1.0 + (target_scale - 1.0) * intensity
 
     # Use a temp file that we control manually to avoid Windows file locking
-    import tempfile
-    import os
     audio_path = None
     try:
         fd, audio_path = tempfile.mkstemp(suffix=".wav")
@@ -178,13 +226,23 @@ def speak(text, emotion="neutral", intensity=0.5):
             # Any problem with the in-process API falls back to the CLI.
             try:
                 _synthesize_with_cli(spoken, audio_path, length_scale)
-            except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+            except subprocess.TimeoutExpired:
+                log.warning("Piper CLI timed out while synthesizing speech")
+                return
+            except (subprocess.CalledProcessError, FileNotFoundError, ModuleNotFoundError):
                 return
         try:
             # A player that never returns would stall the caller forever, and
             # the caller is the thread that owes the user a reply.
-            subprocess.run(audio_player(audio_path), check=True, timeout=120)
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError, RuntimeError):
+            subprocess.run(
+                audio_player(audio_path),
+                check=True,
+                timeout=120,
+                start_new_session=True,
+            )
+        except subprocess.TimeoutExpired:
+            log.warning("Audio playback timed out")
+        except (subprocess.CalledProcessError, FileNotFoundError, RuntimeError):
             # RuntimeError covers "no audio player installed": never let a
             # silent machine break the reply itself.
             pass
@@ -198,8 +256,8 @@ def speak(text, emotion="neutral", intensity=0.5):
 
 def _read_wav(path):
     """Return float32 mono samples and the sample rate of a wav file."""
-    import numpy as np
-
+    if not NUMPY_OK:
+        return None, 0
     with wave.open(path, "rb") as handle:
         frames = handle.readframes(handle.getnframes())
         channels = handle.getnchannels()
@@ -220,9 +278,8 @@ def _read_wav(path):
 
 def _synthesize_pcm(text, length_scale=1.0, noise_scale=0.45, noise_w_scale=0.5):
     """Synthesise straight to samples, with settings that hold a note steady."""
-    import numpy as np
-    from piper import SynthesisConfig
-
+    if not PIPER_AVAILABLE:
+        return None, 0
     if not text or not text.strip():
         return None, 0
     voice = _piper_voice()
@@ -249,7 +306,7 @@ def _synthesize_pcm(text, length_scale=1.0, noise_scale=0.45, noise_w_scale=0.5)
             rate = wav_file.getframerate()
     except Exception:
         return None, 0
-    if width != 2:
+    if not NUMPY_OK or width != 2:
         return None, 0
     data = np.frombuffer(frames, dtype="<i2").astype(np.float32) / 32768.0
     if channels > 1:
@@ -266,8 +323,8 @@ def _synthesize_fragment(text, length_scale=1.0):
 
 
 def _write_wav(path, samples, sample_rate):
-    import numpy as np
-
+    if not NUMPY_OK:
+        return
     clipped = np.clip(samples, -1.0, 1.0)
     pcm = (clipped * 32767.0).astype("<i2").tobytes()
     with wave.open(path, "wb") as handle:
@@ -314,7 +371,14 @@ def sing_song(lyrics, emotion="happy", intensity=0.7, song_name=""):
         os.close(fd)
         _write_wav(audio_path, samples, rate)
         try:
-            subprocess.run(audio_player(audio_path), check=True, timeout=300)
+            subprocess.run(
+                audio_player(audio_path),
+                check=True,
+                timeout=300,
+                start_new_session=True,
+            )
+        except subprocess.TimeoutExpired:
+            log.warning("Song playback timed out")
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError, RuntimeError):
             pass
     except Exception:
@@ -335,7 +399,10 @@ def _sing_fragment_via_cli(text, length_scale):
         _synthesize_with_cli(text, path, length_scale)
         samples, _rate = _read_wav(path)
         return samples if samples.size else None
-    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired, OSError):
+    except subprocess.TimeoutExpired:
+        log.warning("Piper CLI timed out while singing fragment")
+        return None
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
         return None
     finally:
         try:
@@ -358,10 +425,20 @@ def _sing_lines_as_speech(lines, emotion, intensity):
             except Exception:
                 try:
                     _synthesize_with_cli(spoken, audio_file.name, sing_scale)
-                except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+                except subprocess.TimeoutExpired:
+                    log.warning("Piper CLI timed out while singing lyrics")
+                    continue
+                except (subprocess.CalledProcessError, FileNotFoundError, ModuleNotFoundError):
                     continue
             try:
-                subprocess.run(audio_player(audio_file.name), check=True, timeout=120)
+                subprocess.run(
+                    audio_player(audio_file.name),
+                    check=True,
+                    timeout=120,
+                    start_new_session=True,
+                )
+            except subprocess.TimeoutExpired:
+                log.warning("Audio playback timed out while singing lyrics")
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError, RuntimeError):
                 pass
             time.sleep(0.15)
