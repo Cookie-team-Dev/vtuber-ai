@@ -14,6 +14,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import urllib.parse
 import threading
 import time
 from datetime import datetime, timedelta
@@ -57,7 +58,6 @@ _install_lazy_forwarders(
     "browser",
     (
         "browse_website",
-        "close_browser",
         "click_page_element",
         "fill_text_field",
         "follow_link",
@@ -521,7 +521,6 @@ def release_weights_if_starved(reason="idle check"):
 PROMPT_TRIMMABLE = ("memory", "code_file", "screen", "expression")
 # Kept whole for every reply. Her system rules and the words Mommy just said are
 # never candidates for trimming.
-PROMPT_ALWAYS = ("system", "message")
 
 
 def estimate_prompt_tokens(segments):
@@ -587,13 +586,16 @@ def trim_prompt_to_budget(segments):
         return segments
 
     for name in PROMPT_TRIMMABLE:
-        while segments.get(name) and estimate_prompt_tokens(segments) > PROMPT_TOKEN_BUDGET:
+        while segments.get(name) and tokens > PROMPT_TOKEN_BUDGET:
             shortened = (
                 _shorten_memory(segments[name]) if name == "memory" else _halve(segments[name])
             )
             if shortened is None:
                 break  # This block has nothing left to give; try the next one.
             segments[name] = shortened
+        tokens = estimate_prompt_tokens(segments)
+        if tokens <= PROMPT_TOKEN_BUDGET:
+            break
 
     tokens = estimate_prompt_tokens(segments)
     if tokens > PROMPT_TOKEN_BUDGET:
@@ -1282,15 +1284,6 @@ THINKING_REQUEST_PATTERN = re.compile(
     r"\bhow (?:did you decide|do you know|did you reach that conclusion)\b|\bwhat led you to\b",
     re.IGNORECASE,
 )
-ADVANCED_TOPIC_PATTERN = re.compile(
-    r"\b(?:code|coding|program|algorithm|architecture|refactor|optimi[sz]e|implement|debug|error|"
-    r"exception|async|await|class|function|method|module|package|library|framework|api|endpoint|"
-    r"database|query|schema|sql|cpu|gpu|performance|bottleneck|throughput|latency|concurrency|"
-    r"design pattern|interface|bottleneck|complexity|abstraction|encapsulation|inheritance|polymorphism|"
-    r"docker|kubernetes|container|microservice|serverless|deploy|pipeline|CI/CD|testing|unit test|"
-    r"regex|parse|syntax|semantic|compiler|runtime|stack trace)\b",
-    re.IGNORECASE,
-)
 CODE_FILE_REFERENCE_PATTERN = re.compile(
     r"\b([a-z_]+\.py|memory\.json|mood\.json|persona\.json|Modelfile)\b",
     re.IGNORECASE,
@@ -1436,7 +1429,7 @@ def detect_compliment(message):
         return None
     lower = message.lower()
     for key, replies in COMPLIMENT_REPLIES.items():
-        if key in lower:
+        if re.search(r"\b" + re.escape(key) + r"\b", lower):
             return random.choice(replies)
     return None
 
@@ -1606,7 +1599,6 @@ LEAKED_FIELD_PATTERN = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 NICKNAME_PATTERN = re.compile(r"\bsweeties?\b", re.IGNORECASE)
-NICKNAME_REPLACEMENT = "mommy"
 
 # The model is small enough that it sometimes answers with the raw JSON envelope
 # instead of speech. These are the control fields it is supposed to fill in, so
@@ -1650,7 +1642,6 @@ _BARE_ASTERISK_PATTERN = re.compile(r"(?<=\w)\*+|\*+(?=\w)")
 _MULTI_SPACE_PATTERN = re.compile(r"[ \t]{2,}")
 _SPACE_BEFORE_PUNCTUATION_PATTERN = re.compile(r"\s+([,.!?])")
 _THOUGHT_WORD_PATTERN = re.compile(r"[a-z][a-z0-9']{3,}")
-_RECALL_TOKEN_PATTERN = re.compile(r"[a-z0-9_']+")
 _BOOST_THOUGHT_PATTERN = re.compile(r"\b(thought|think|thinking|feel|felt|wonder|wondered|daydream|inner voice)\b")
 _BOOST_ACTION_PATTERN = re.compile(r"\b(do|did|doings?|edit|edited|fix|fixed|change|changed|action|tool|use|used|ran|run|clicks?|typed?|wrote|code)\b")
 _BOOST_SPEECH_PATTERN = re.compile(r"\b(say|said|tell|told|reply|replied|answer|asked|ask|mention)\b")
@@ -2099,11 +2090,6 @@ def listen_video(target):
     return video_perception.listen_to_file(target)
 
 
-def _encode_image_bytes(data):
-    """Base64-encode raw image bytes."""
-    import base64
-
-    return base64.b64encode(data).decode("ascii")
 
 
 def _fmt_dur(seconds):
@@ -2823,9 +2809,6 @@ _TRAILING_EMOJI_PATTERN = re.compile(
     "|️|‍|[\U0001F3FB-\U0001F3FF])+$"
 )
 # Openers that are fine once in a while but become a tic when they repeat.
-TIRED_OPENERS = frozenset({"aww", "aah", "awww", "ahh", "oh", "ooh", "hey", "hi", "yay",
-                           "yes", "yeah", "yep", "wow", "whoa", "hmm", "hm", "uh", "well",
-                           "ohh", "ah", "ahh", "eek", "augh"})
 
 
 def _reply_opener(text):
@@ -3968,20 +3951,6 @@ def person_relation(user_id):
     return str(person.get("relation") or "").strip()
 
 
-def set_person_relation(user_id, relation):
-    """Give one Discord account a place in her family, or take it away with ""."""
-    if not user_id:
-        return ""
-    key = str(user_id)
-    with _PEOPLE_LOCK:
-        person = _DISCORD_PEOPLE.setdefault(key, {"display_name": key, "history": []})
-        relation = str(relation or "").strip()
-        if relation:
-            person["relation"] = relation
-        else:
-            person.pop("relation", None)
-        _save_people_locked()
-    return relation
 
 
 
@@ -4299,22 +4268,6 @@ def _match_dm_target(text, speaker_id=None):
     return best, best_end
 
 
-def resolve_dm_target(text, speaker_id=None):
-    """The person a message is meant for, matched against who she already knows.
-
-    Only people she has actually spoken to can be picked. An account that has
-    never appeared in a channel is not somebody she can write to, and taking an
-    id out of the message instead would mean anybody could aim her at any
-    account on the server.
-
-    The recipient is the name that follows "dm", not the best name in the line.
-    "dm mommy that kazuma says hi" has two names in it and the second one is
-    part of the message, not the destination; scoring both equally sent it to
-    kazuma. So a name sitting after the marker beats a name sitting before it,
-    and the one nearest the marker wins.
-    """
-    person, _end = _match_dm_target(text, speaker_id)
-    return person
 
 
 def parse_dm_request(message, speaker_id=None):
@@ -6028,8 +5981,6 @@ def edit_code_file(filename, content):
 
 _SCREENSHOT_CACHE = None
 _SCREENSHOT_TIME = 0
-ACTIVE_WINDOW_CACHE = None
-ACTIVE_WINDOW_TIME = 0
 _SCREEN_OBSERVATION_CACHE = None
 _SCREEN_OBSERVATION_TIME = 0
 
@@ -6853,71 +6804,6 @@ def _read_drm_framebuffer(fd, fb_id, max_size):
     return None
 
 
-def analyze_screen():
-    """Take a screenshot and extract basic screen information to describe desktop state."""
-    display_env = os.environ.get("DISPLAY")
-    wayland_env = os.environ.get("WAYLAND_DISPLAY")
-    
-    if display_env:
-        try:
-            import subprocess
-            active_title = subprocess.run(
-                ["xdotool", "getactivewindow", "get", "WM_NAME"],
-                capture_output=True, text=True, timeout=3
-            ).stdout.strip()
-
-            windows = subprocess.run(
-                ["xdotool", "search", "--name", ""],
-                capture_output=True, text=True, timeout=3
-            ).stdout.strip().split('\n')
-            window_count = len([w for w in windows if w])
-            
-            return f"Active window: {active_title or 'Unknown'}. Open windows: {window_count} detected."
-        except Exception:
-            return "Active window: Unknown. X11 tools unavailable."
-    
-    if wayland_env:
-        try:
-            import subprocess
-            # Check if screencopy is available via C helper
-            helper_path = os.path.join(os.path.dirname(__file__), ".kilo_screencopy")
-            if os.path.isfile(helper_path):
-                result = subprocess.run(
-                    [helper_path],
-                    capture_output=True, text=True, timeout=3,
-                    env={**os.environ}
-                )
-                if "screencopy=available" in result.stdout:
-                    return "Screen capture is available (Wayland screencopy protocol active)."
-                if result.stdout.strip():
-                    return result.stdout.strip()
-        
-            # Try to get display info from sysfs
-            import glob
-            displays = []
-            for connector in sorted(glob.glob("/sys/class/drm/card1-*")):
-                name = os.path.basename(connector)
-                try:
-                    status_path = os.path.join(connector, "status")
-                    with open(status_path, "r") as f:
-                        status = f.read().strip()
-                    if status == "connected":
-                        mode_path = os.path.join(connector, "modes")
-                        modes = ""
-                        if os.path.exists(mode_path):
-                            with open(mode_path, "r") as f:
-                                modes = f.read().strip()
-                        displays.append(f"{name} ({modes})")
-                except Exception:
-                    pass
-            
-            if displays:
-                return f"Wayland session. Displays: {', '.join(displays)}"
-            return "Wayland session active. No detailed screen info available."
-        except Exception:
-            return "Wayland session detected but screen info unavailable."
-    
-    return "No display server detected (headless environment)."
 
 
 def observe_screen():
@@ -7143,41 +7029,6 @@ def move_mouse(x, y):
         return f"Mouse move error: {e}"
 
 
-def get_desktop_state():
-    """Get comprehensive desktop state information."""
-    parts = []
-    display = os.environ.get("DISPLAY", ":0.0")
-    
-    try:
-        import subprocess
-        result = subprocess.run(["xdotool", "search", "--name", ""], capture_output=True, text=True, timeout=3, env={**os.environ, "DISPLAY": display})
-        window_count = len(result.stdout.strip().split('\n')) if result.stdout.strip() else 0
-        parts.append(f"Window count: {window_count}")
-    except Exception:
-        parts.append("Window count: unknown (no display)")
-    try:
-        result = subprocess.run(["xdotool", "getactivewindow", "get", "WM_NAME"],
-                                capture_output=True, text=True, timeout=3, env={**os.environ, "DISPLAY": display})
-        active = result.stdout.strip() or "unknown"
-        parts.append(f"Active window: {active}")
-    except Exception:
-        parts.append("Active window: unknown (no display)")
-    try:
-        import subprocess
-        result = subprocess.run(["xdotool", "getmouselocation", "--shell"],
-                                capture_output=True, text=True, timeout=3, env={**os.environ, "DISPLAY": display})
-        if result.returncode == 0 and result.stdout:
-            coords = {}
-            for line in result.stdout.strip().split('\n'):
-                if '=' in line:
-                    k, v = line.split('=', 1)
-                    coords[k] = v
-            parts.append(f"Mouse at: ({coords.get('X', '?')}, {coords.get('Y', '?')})")
-        else:
-            parts.append("Mouse position: unavailable (no display)")
-    except Exception:
-        parts.append("Mouse position: unavailable")
-    return "\n".join(parts)
 
 
 # -----------------------------------------------------------------
@@ -9020,7 +8871,7 @@ def enqueue_voice(text=None, emotion="neutral", intensity=0.5, song_lyrics=None,
 # AI
 # -----------------------------
 
-def _plain_text_reply(message, system, address_rules="", speaker_label="Mommy"):
+def _plain_text_reply(message, address_rules="", speaker_label="Mommy"):
     """Retry without JSON mode. Guarantees a real conversational answer.
 
     address_rules comes in from the caller: this path used to name a variable
@@ -9084,7 +8935,7 @@ def _plain_text_reply(message, system, address_rules="", speaker_label="Mommy"):
         return ""
 
 
-def _plain_text_replies(message, system, address_rules="", speaker_label="Mommy"):
+def _plain_text_replies(message, address_rules="", speaker_label="Mommy"):
     """Plain-text answers until one of them is usable, or the attempts run out.
 
     A canned "Not sure what to say, honestly." is the worst thing she can say to
@@ -9102,7 +8953,7 @@ def _plain_text_replies(message, system, address_rules="", speaker_label="Mommy"
     """
     attempts = 2 if fastai.available() else 1
     for _attempt in range(attempts):
-        answer = _plain_text_reply(message, system, address_rules, speaker_label)
+        answer = _plain_text_reply(message, address_rules, speaker_label)
         if answer:
             return answer
     return ""
@@ -9723,6 +9574,11 @@ def ask_ai(
             face_outcome = execute_tool_call(
                 "remember_face", f"{face_name}|{face_photo}"
             )
+            if face_photo and face_photo != video_target:
+                try:
+                    os.unlink(face_photo)
+                except OSError:
+                    pass
             video_context = (
                 f"Mommy just introduced somebody, and you have "
                 f"already run remember_face on the photo. "
@@ -9753,7 +9609,7 @@ def ask_ai(
                 "instead of describing one you did not watch. "
             )
     if context_note:
-        code_changes_context = f"{context_note}\n\n"
+        code_changes_context = f"{context_note}\n\n{code_changes_context}"
     if video_context:
         code_changes_context = f"{video_context}\n\n{code_changes_context}"
     screen_context = _screen_context_for_message(message)
@@ -10012,7 +9868,7 @@ f"tool_call to {{tool:'read_code_file',arg_value:'filename'}}, "
                 print("Reply hit the token limit - trimming the unfinished sentence.")
         except requests.exceptions.RequestException as error:
             print("Ollama request failed:", error)
-            plain = _plain_text_replies(original_message, system, address_rules, speaker_label)
+            plain = _plain_text_replies(original_message, address_rules, speaker_label)
             data = json.dumps({"reply": plain, "emotion": "happy"}) if plain else ""
         initial_result = {"reply": "", "emotion": "happy"}
         parsed = None
@@ -10200,7 +10056,7 @@ f"tool_call to {{tool:'read_code_file',arg_value:'filename'}}, "
             result["reply"] = f"Here you go — {explicit_expression}."
         else:
             # JSON mode failed to produce a real answer — retry in plain text mode.
-            plain = _plain_text_replies(original_message, system, address_rules, speaker_label)
+            plain = _plain_text_replies(original_message, address_rules, speaker_label)
             result["reply"] = plain or random.choice(FALLBACK_REPLIES)
 
     # If the reply seems generic or empty, try compliment detection first
@@ -10266,7 +10122,6 @@ REPLY_FIELD_NAMES = (
     "reply", "response", "text", "answer", "message", "output", "content",
     "say", "words", "speech", "dialogue", "utterance",
 )
-EMOTION_FIELD_NAMES = ("emotion", "emotions", "feeling", "feelings", "mood", "expression")
 MOOD_FIELD_NAMES = ("mood", "emotion", "feeling")
 INTENSITY_FIELD_NAMES = ("mood_intensity", "intensity", "strength", "level", "energy")
 THINKING_FIELD_NAMES = ("thinking_summary", "thinking", "thought", "thoughts", "reasoning", "inner_monologue")
@@ -11678,7 +11533,7 @@ def discord_switch_command(text):
     if action == "draw":
         if not note:
             return "Draw what? /kookie draw: a cute cat, a sunset, anything you want!"
-        return f"Image URL: https://image.pollinations.ai/prompt/{note.replace(' ', '%20')}?width=512&height=512&nologo=true"
+        return f"Image URL: https://image.pollinations.ai/prompt/{urllib.parse.quote(note)}?width=512&height=512&nologo=true"
     return note
 
 

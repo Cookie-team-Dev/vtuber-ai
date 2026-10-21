@@ -28,7 +28,7 @@ railway up
 ```
 
 Add these environment variables in Railway dashboard:
-- `KOOKIE_WEB_FAMILY_KEY=kookieitsmeoneofyourfamily10293927`
+- `KOOKIE_WEB_FAMILY_KEY=__SET_IN_ENV__`
 - `KOOKIE_WEB_PORT=8080`
 
 ### Option 2: Render
@@ -42,7 +42,7 @@ services:
     startCommand: python webui.py
     envVars:
       - key: KOOKIE_WEB_FAMILY_KEY
-        value: kookieitsmeoneofyourfamily10293927
+        value: __SET_IN_ENV__
       - key: KOOKIE_WEB_PORT
         value: 8080
 ```
@@ -61,7 +61,7 @@ cd vtuber-ai
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-KOOKIE_WEB_FAMILY_KEY=kookieitsmeoneofyourfamily10293927 KOOKIE_WEB_PORT=8080 nohup python webui.py &
+KOOKIE_WEB_FAMILY_KEY=__SET_IN_ENV__ KOOKIE_WEB_PORT=8080 nohup python webui.py &
 ```
 
 ## Connect Frontend to Backend
@@ -90,7 +90,7 @@ fetch(window.KOOKIE_API_BASE + '/api/provider', ...
 
 ```bash
 # Terminal 1: Start backend
-KOOKIE_WEB_PORT=8080 KOOKIE_WEB_FAMILY_KEY="kookieitsmeoneofyourfamily10293927" python webui.py
+KOOKIE_WEB_PORT=8080 KOOKIE_WEB_FAMILY_KEY="__SET_IN_ENV__" python webui.py
 
 # Terminal 2: Serve frontend (optional)
 cd web && python -m http.server 3000
@@ -99,7 +99,7 @@ cd web && python -m http.server 3000
 
 ## Family Keys
 
-- **Family**: `kookieitsmeoneofyourfamily10293927` + Discord ID
+- **Family**: `__SET_IN_ENV__` + Discord ID
 - **Stranger**: `kookieAIdiscord.me`
 
 ## Developer Access

@@ -690,9 +690,11 @@ async def maybe_switch(text: str, message, label: str) -> bool:
         if client is None:
             await _get_speak()(channel, f"I could not join the voice channel: {err}", speak=False)
             return True
-        from discord_bot import get_voice_enabled
+        from discord_bot import get_voice_enabled, _VOICE_ENABLED as db_ve
+        import discord_bot as db
         get_voice_enabled().add(guild_id)
         print(f"[VOICE TEXT CMD] Added guild {guild_id} to _VOICE_ENABLED: {list(get_voice_enabled())}")
+        print(f"[VOICE TEXT CMD] discord_bot module id: {id(db)}, _VOICE_ENABLED id: {id(db._VOICE_ENABLED)}, get_voice_enabled() id: {id(get_voice_enabled())}")
         await _get_speak()(
             channel,
             f"Joined {vc.channel.name} - I will speak there now 💕",

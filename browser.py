@@ -15,7 +15,7 @@ import urllib.error
 import urllib.request
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as _FutureTimeout
-from urllib.parse import quote_plus, urljoin, urlparse
+from urllib.parse import quote_plus, unquote, urljoin, urlparse
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeout
 from playwright.sync_api import sync_playwright
@@ -525,8 +525,6 @@ def unsafe_url_reason(url, resource_type="document"):
 
     # The path is unquoted first, or %70%6f%72%6e walks straight past the list.
     try:
-        from urllib.parse import unquote
-
         path = unquote(parsed.path or "").lower()
         query = unquote(parsed.query or "").lower()
     except (UnicodeDecodeError, ValueError):
@@ -656,6 +654,7 @@ def _confirm(message):
 
 
 _RESOLVED_HOSTS = {}
+_RESOLVED_HOSTS_TTL = 60.0
 
 
 def _resolve_host(hostname, port):
@@ -665,13 +664,19 @@ def _resolve_host(hostname, port):
     page with 200 sub-resources would otherwise do 200 identical DNS lookups.
     """
     key = (hostname, port)
-    addresses = _RESOLVED_HOSTS.get(key)
-    if addresses is None:
-        addresses = [
-            ipaddress.ip_address(result[4][0])
-            for result in socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
-        ]
-        _RESOLVED_HOSTS[key] = addresses
+    now = time.monotonic()
+    cached = _RESOLVED_HOSTS.get(key)
+    if cached is not None and cached[1] > now:
+        return cached[0]
+    addresses = [
+        ipaddress.ip_address(result[4][0])
+        for result in socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+    ]
+    _RESOLVED_HOSTS[key] = (addresses, now + _RESOLVED_HOSTS_TTL)
+    # Keep the cache from growing without bound.
+    if len(_RESOLVED_HOSTS) > 256:
+        oldest = min(_RESOLVED_HOSTS, key=lambda k: _RESOLVED_HOSTS[k][1])
+        del _RESOLVED_HOSTS[oldest]
     return addresses
 
 
@@ -799,7 +804,7 @@ def _flatpak_listing():
 
 def _flatpak_browser_app():
     """A Chrome installed as a Flatpak: (app id, whether it belongs to the host)."""
-    installed, on_host = set(_flatpak_listing()[0]), _flatpak_listing()[1]
+    installed, on_host = _flatpak_listing(); installed = set(installed)
     for app in ("com.google.Chrome", "org.chromium.Chromium"):
         if app in installed:
             return app, on_host
@@ -926,8 +931,8 @@ def _attach_to_running_chrome(playwright, started_by_her=False):
     # the guard, so a refusal is not allowed to fail the whole attach.
     try:
         context.route("**/*", _guard_request)
-    except Exception:
-        pass
+    except Exception as error:
+        print("Could not install the network guard on the attached Chrome:", error)
     page, own_page = _pick_attached_page(context)
     page.bring_to_front()
     _ATTACHED_NOTE = (
@@ -1232,16 +1237,19 @@ def _load_page(page, destination, seconds=None):
                 pass
             return
         except Exception as error:
-            transient = "ERR_ABORTED" in str(error) or "Timeout" in str(error)
+            text = str(error)
+            transient = ("ERR_ABORTED" in text or "Timeout" in text
+                         or isinstance(error, PlaywrightTimeout))
             if not transient or attempt:
                 raise
             # Let the page finish moving, or the machine finish breathing.
-            time.sleep(2.0 if "ERR_ABORTED" in str(error) else 5.0)
+            time.sleep(2.0 if "ERR_ABORTED" in text else 5.0)
 
 
-@_browser_action
 def _transient_page_error(error):
     """Is this the page moving out from under a read, rather than a broken read?"""
+    if isinstance(error, PlaywrightTimeout):
+        return False
     text = str(error)
     return any(marker in text for marker in (
         "Execution context was destroyed",
@@ -1354,8 +1362,8 @@ def browse_website(target, stop_check=None, autonomous=False):
         try:
             if stop_check():
                 return "She stood down before the page opened."
-        except Exception:
-            pass
+        except Exception as error:
+            print("stop_check failed:", error)
     try:
         address, is_search = _browse_address(target)
     except BlockedPage as blocked:
@@ -1377,8 +1385,8 @@ def browse_website(target, stop_check=None, autonomous=False):
         try:
             if stop_check():
                 return "She stood down before reading the page."
-        except Exception:
-            pass
+        except Exception as error:
+            print("stop_check failed:", error)
     if is_search:
         return _read_search_results(page)
     return _read_page_text(page)
@@ -1441,9 +1449,10 @@ def follow_link(link_text):
             "link's visible text."
         )
 
+    hrefs = link.evaluate_all("elements => elements.map(element => element.getAttribute('href') || '')")
     destinations = {
-        urljoin(page.url, link.nth(index).get_attribute("href") or "")
-        for index in range(count)
+        urljoin(page.url, href or "")
+        for href in hrefs
     }
     destinations.discard(page.url)
     if not destinations:

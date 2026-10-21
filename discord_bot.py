@@ -26,7 +26,9 @@ import logging
 import os
 import re
 import signal
+import stat
 import socket
+import ipaddress
 import sys
 import tempfile
 import threading
@@ -38,6 +40,7 @@ import urllib.parse
 # is what the voice_recv router does when its reader finishes - does not get
 # mistaken for the client dying. The original behaviour is kept; only the
 # noisy traceback that used to print on every stop is gone.
+import fastai
 import discord.ext.voice_recv.reader as reader_mod
 
 _original_stop = reader_mod.AudioReader.stop
@@ -66,16 +69,10 @@ class _VoiceEnabledSet(set):
         print(f"[_VOICE_ENABLED] CLEAR (was: {list(self)})")
         super().clear()
 
-_VOICE_ENABLED = None
-_VOICE_INITIALIZED = False
+_VOICE_ENABLED = _VoiceEnabledSet()
 
 def get_voice_enabled():
-    """Get the current _VOICE_ENABLED set (lazy initialization)."""
-    global _VOICE_ENABLED, _VOICE_INITIALIZED
-    if not _VOICE_INITIALIZED:
-        _VOICE_ENABLED = _VoiceEnabledSet()
-        _VOICE_INITIALIZED = True
-        print(f"[_VOICE_ENABLED] Initialized")
+    """Get the current _VOICE_ENABLED set (initialized at module scope)."""
     return _VOICE_ENABLED
 
 def set_voice_enabled(new_set):
@@ -179,6 +176,7 @@ _install_doh_resolver()
 # Discord refuses messages over 2000 characters, and replies are split below a
 # limit that leaves room for the rest of a sentence rather than cutting one.
 MESSAGE_LIMIT = 1900
+NO_PINGS = discord.AllowedMentions.none()
 
 # How long she usually takes, and how long to wait before telling somebody she
 # is still working. She is slow because the model is small and the machine is
@@ -257,6 +255,7 @@ except ValueError:
 
 _client: discord.Client = None
 _worker: asyncio.Task = None
+_tree = None
 # The last channel somebody actually spoke to her in. It is where an unprompted
 # line belongs: the conversation she was part of, rather than a channel chosen
 # out of a list of every one the bot can see.
@@ -279,6 +278,46 @@ _HER_LAST_WORDS = {}
 GREETING_OPENERS = (
     r"(?:hey|hi|hello|yo|ok|okay|so|um+|uh+|well|psst|look|excuse me|"
     r"mommy|mom)\b[,:]?"
+)
+
+# Anime style terms used to detect anime image prompts.
+# Hoisted to module level so the draw handler can reference it
+# without rebuilding the tuple on every request.
+ANIME_STYLE_TERMS = (
+    "anime", "manga", "waifu", "husbando", "kawaii", "senpai",
+    "chan", "sama", "sensei", "shonen", "shoujo", "isekai",
+    "oppai", "baka", "desu", "nya", "rawr", "monke",
+    "naruto", "one piece", "dragon ball", "attack on titan",
+    "demon slayer", "jujutsu kaisen", "my hero academia",
+    "re zero", "re:zero", "sword art online", "sao",
+    "fate", "fate/stay", "fate grand order", "fgo",
+    "pokemon", "spy x family", "chainsaw man",
+    "bleach", "gintama", "hunter x hunter", "hxh",
+    "fullmetal alchemist", "fma", "code geass",
+    "steins;gate", "cowboy bebop", "neon genesis evangelion",
+    "evangelion", "one punch man", "opm", "mob psycho 100",
+    "tokyo ghoul", "parasyte", "death note",
+    "soul eater", "black butler", "kuroshitsuji",
+    "noragami", "blue exorcist", "ao no exorcist",
+    "magi", "akame ga kill", "kill la kill",
+    "gurren lagann", "durarara",
+    "baccano", "monogatari", "kara no kyoukai",
+    "overlord", "that time i got reincarnated as a slime",
+    "tensei shitara slime datta ken", "slime",
+    "mushoku tensei", "jobless reincarnation",
+    "the rising of the shield hero", "tate no Yuusha",
+    "konosuba", "kono subarashii",
+    "reincarnated as a sword",
+    "tensei shitara ken deshita", "blade",
+    "the wrong way to use healing magic",
+    "healing magic no wrong use",
+    "solo leveling", "omniscient reader",
+    "orv", "tbate", "trash of the count's family",
+    "tcf", "lcf", "lout of count's family",
+    "survival story in a fantasy world",
+    "apothecary diary", "kusuriya no hitorigoto",
+    "honey lemon soda", "honey and lemon",
+    "the apothecary diaries"
 )
 
 async def _voice_join(channel):
@@ -378,6 +417,11 @@ def read_token():
     if token:
         return token
     try:
+        st = os.stat(TOKEN_FILE)
+        mode = stat.S_IMODE(st.st_mode)
+        if mode & 0o077:
+            print(f"Discord bot: {TOKEN_FILE} is readable by group/world ({oct(mode)}); chmod 600")
+            os.chmod(TOKEN_FILE, 0o600)
         with open(TOKEN_FILE, "r", encoding="utf-8") as handle:
             return handle.read().strip()
     except OSError:
@@ -540,14 +584,13 @@ class TypingReply:
         self = cls(channel, speaker_name)
         self.loop = asyncio.get_running_loop()
         try:
-            self.message = await channel.send(cls.PLACEHOLDER)
+            self.message = await channel.send(cls.PLACEHOLDER, allowed_mentions=NO_PINGS)
             self.shown = True
         except discord.HTTPException as error:
             # No permission, or the channel is gone: fall back to a plain send
             # later rather than failing the whole turn over a cosmetic extra.
             print("Discord bot: could not post the typing placeholder:", error)
             self.message = None
-        self.lock = asyncio.Lock()
         return self
 
     def feed(self, partial):
@@ -585,11 +628,10 @@ class TypingReply:
         try:
             await self.message.edit(content=content)
             self.edited = content
-        except discord.HTTPException:
-            # Rate limited or the message was deleted. Stop trying: the final
-            # send still happens, so a lost edit costs polish, not the reply.
-            self.dropped = True
-            self.message = None
+        except discord.HTTPException as e:
+            if getattr(e, "status", None) == 404:
+                self.dropped = True
+                self.message = None
 
     async def drain(self):
         """Make sure the last thing she wrote is actually on screen."""
@@ -601,6 +643,10 @@ class TypingReply:
 
     async def finish(self, final):
         if self.message is None:
+            try:
+                await self.channel.send(final, allowed_mentions=NO_PINGS)
+            except discord.HTTPException:
+                pass
             return
         await self._edit(final)
         self.message = None
@@ -637,7 +683,7 @@ async def think_and_reply(channel, label, text, user_id=None, burst_note=""):
         # that has stopped answering. One short line, once, then nothing.
         await asyncio.sleep(NUDGE_AFTER_SECONDS)
         try:
-            await channel.send("Still thinking - my brain is small and this machine is busy.")
+            await channel.send("Still thinking - my brain is small and this machine is busy.", allowed_mentions=NO_PINGS)
         except discord.HTTPException:
             pass
 
@@ -696,7 +742,8 @@ async def think_and_reply(channel, label, text, user_id=None, burst_note=""):
         if getattr(channel, "guild", None):
             guild_id = channel.guild.id
             voice_enabled = get_voice_enabled()
-            print(f"[CHAT READER] streamer path: guild_id={guild_id} in _VOICE_ENABLED={guild_id in voice_enabled} _VOICE_ENABLED={list(voice_enabled)}")
+            import discord_bot as self_mod
+            print(f"[CHAT READER] streamer path: guild_id={guild_id} in _VOICE_ENABLED={guild_id in voice_enabled} _VOICE_ENABLED={list(voice_enabled)} module_id={id(self_mod)}")
             if guild_id in voice_enabled:
                 try:
                     from discord_commands import chat_reader_speak_message
@@ -730,8 +777,6 @@ def _one_turn(text, on_reply_text=None, context_note="", speaker_name=None, spea
             speaker_is_owner=speaker_is_owner,
             speaker_id=speaker_id,
         )
-    except Exception:
-        raise
     finally:
         controller.conversation_lock.release()
         controller.schedule_idle_check()
@@ -849,7 +894,7 @@ async def drain_queue():
                 pass
             else:
                 try:
-                    await channel.send("My brain went fuzzy for a second - ask me again?")
+                    await channel.send("My brain went fuzzy for a second - ask me again?", allowed_mentions=NO_PINGS)
                 except discord.HTTPException:
                     pass
         finally:
@@ -1140,7 +1185,7 @@ def _words_key(text):
     return " ".join(re.findall(r"[a-z0-9']+", str(text or "").lower()))
 
 
-def _she_already_said_that(text, channel_name):
+def _she_already_said_that(text, channel_id):
     """True when this is word for word what she last said in this channel.
 
     A duplicate send is the loudest version of "she keeps saying the same
@@ -1152,7 +1197,7 @@ def _she_already_said_that(text, channel_name):
     words = _words_key(text)
     if len(words.split()) < 6:
         return False
-    return words in _HER_LAST_WORDS.get(str(channel_name), set())
+    return words in _HER_LAST_WORDS.get(str(channel_id), set())
 
 
 async def _speak_into(channel, text, speak=True):
@@ -1177,28 +1222,37 @@ async def _speak_into(channel, text, speak=True):
             return result
         # Fall through to text send if image fails
     
-    name = channel_name_of_channel(channel)
-    if _she_already_said_that(text, name):
-        print(f"Discord bot: not sending the same sentence twice in #{name}")
+    cid = getattr(channel, "id", None)
+    if _she_already_said_that(text, cid):
+        print(f"Discord bot: not sending the same sentence twice in #{getattr(channel, "name", "?")}")
         return None
-    try:
-        sent = await channel.send(text, tts=bool(speak and TTS))
-    except discord.HTTPException as error:
-        if not (speak and TTS):
-            print("Discord bot: could not send:", error)
-            return None
+    pieces = split_reply(text)
+    sent = None
+    for index, piece in enumerate(pieces):
         try:
-            sent = await channel.send(text)
-        except discord.HTTPException as second:
-            print("Discord bot: could not send:", second)
-            return None
-    if name is not None:
-        recent = _HER_LAST_WORDS.setdefault(str(name), collections.deque(maxlen=8))
+            sent = await channel.send(
+                piece,
+                tts=bool(speak and TTS and index == 0),
+                allowed_mentions=NO_PINGS,
+            )
+        except discord.HTTPException as error:
+            if not (speak and TTS):
+                print("Discord bot: could not send:", error)
+                return None
+            try:
+                sent = await channel.send(piece, allowed_mentions=NO_PINGS)
+            except discord.HTTPException as second:
+                print("Discord bot: could not send:", second)
+                return None
+    if cid is not None:
+        recent = _HER_LAST_WORDS.setdefault(str(cid), collections.deque(maxlen=8))
         recent.append(_words_key(text))
     _record_her_send(sent)
     if speak and getattr(channel, "guild", None):
         guild_id = channel.guild.id
         voice_enabled = get_voice_enabled()
+        import discord_bot as self_mod
+        print(f"[_speak_into] guild_id={guild_id} in _VOICE_ENABLED={guild_id in voice_enabled} _VOICE_ENABLED={list(voice_enabled)} module_id={id(self_mod)}")
         if guild_id in voice_enabled:
             # Use chat reader to speak in voice channel (handles self mode for bot's own messages)
             try:
@@ -1262,12 +1316,12 @@ async def _send_dm(channel_like, text):
     still a message worth sending, so the words go out either way.
     """
     try:
-        return _record_her_send(await channel_like.send(text, tts=bool(TTS))), None
+        return _record_her_send(await channel_like.send(text, tts=bool(TTS), allowed_mentions=NO_PINGS)), None
     except discord.Forbidden as error:
         if not TTS:
             return None, f"Discord refused it ({error.status})"
         try:
-            return _record_her_send(await channel_like.send(text)), None
+            return _record_her_send(await channel_like.send(text, allowed_mentions=NO_PINGS)), None
         except discord.HTTPException as second:
             return None, f"Discord refused it ({second.status})"
     except discord.HTTPException as error:
@@ -1278,9 +1332,33 @@ async def _send_image(channel_like, image_url, caption=""):
     """Download an image from a URL and send it to Discord."""
     import io
     import requests as _requests
-    
+    import urllib.parse
+
+    # SSRF validation: only https, no loopback/private/link-local/CGNAT, no redirects
+    parsed = urllib.parse.urlparse(image_url)
+    if parsed.scheme != "https":
+        return None, f"Only https URLs are allowed (got {parsed.scheme!r})"
+    hostname = parsed.hostname
+    if not hostname:
+        return None, "URL has no hostname"
     try:
-        resp = _requests.get(image_url, timeout=30, headers={"User-Agent": "KookieAi/1.0"})
+        infos = socket.getaddrinfo(hostname, None)
+    except OSError as error:
+        return None, f"Could not resolve {hostname}: {error}"
+    cgnat_start = ipaddress.IPv4Address("100.64.0.0")
+    cgnat_end = ipaddress.IPv4Address("100.127.255.255")
+    for info in infos:
+        addr = info[4][0]
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            continue
+        if ip.is_loopback or ip.is_private or ip.is_link_local:
+            return None, f"URL resolves to {addr}, which is a loopback/private/link-local address"
+        if ip.version == 4 and cgnat_start <= ip <= cgnat_end:
+            return None, f"URL resolves to {addr}, which is in the CGNAT range"
+    try:
+        resp = _requests.get(image_url, timeout=30, headers={"User-Agent": "KookieAi/1.0"}, allow_redirects=False)
         if resp.status_code != 200:
             return None, f"Could not download image: HTTP {resp.status_code}"
         
@@ -1295,8 +1373,8 @@ async def _send_image(channel_like, image_url, caption=""):
         
         file = discord.File(io.BytesIO(resp.content), filename="kookie_image.png")
         if caption:
-            return await channel_like.send(caption, file=file), None
-        return await channel_like.send(file=file), None
+            return await channel_like.send(caption, file=file, allowed_mentions=NO_PINGS), None
+        return await channel_like.send(file=file, allowed_mentions=NO_PINGS), None
     except Exception as error:
         return None, f"Could not send image: {error}"
 
@@ -1440,9 +1518,10 @@ async def _handle_ready(client):
     if _worker is None or _worker.done():
         _worker = asyncio.ensure_future(drain_queue())
         print("Discord bot: drain_queue worker started")
-    # Slash commands require discord.Bot, but we use discord.Client for now.
-    # This feature is disabled to prevent startup crashes.
-    pass
+    try:
+        await _tree.sync()
+    except discord.HTTPException as e:
+        print("Discord bot: slash sync failed:", e)
 
 
 async def _maybe_switch(text, message, label):
@@ -1487,68 +1566,78 @@ async def _handle_message(message):
         prompt = draw_match.group(1).strip()
         if prompt:
             print(f"Discord bot: {label} asked Kookie to draw: {prompt[:80]}")
-            await message.channel.send(f"🎨 Drawing: {prompt}...")
+            await message.channel.send(f"🎨 Drawing: {prompt}...", allowed_mentions=NO_PINGS)
+            
+            # Build the best possible prompt for character accuracy
+            enhanced_prompt = prompt
             
             # Check for "character from show" format
             from_match = re.search(r"(.+?)\s+from\s+(.+)$", prompt, re.IGNORECASE)
             if from_match:
                 char_name = from_match.group(1).strip()
                 show_name = from_match.group(2).strip()
-                prompt = f"{char_name} from {show_name}, anime character design, official art style, high quality, detailed, vibrant colors, professional artwork"
+                enhanced_prompt = (
+                    f"{char_name} from {show_name}, "
+                    f"anime character portrait, official art style, "
+                    f"high quality, detailed face, accurate character design, "
+                    f"vibrant colors, professional artwork, "
+                    f"sharp focus, studio quality, 4K detail"
+                )
             
-            # Auto-detect anime style
-            anime_keywords = ("anime", "manga", "waifu", "husbando", "kawaii", "senpai",
-                            "chan", "sama", "sensei", "shonen", "shoujo", "isekai",
-                            "oppai", "baka", "desu", "nya", "rawr", "monke",
-                            "naruto", "one piece", "dragon ball", "attack on titan",
-                            "demon slayer", "jujutsu kaisen", "my hero academia",
-                            "re zero", "re:zero", "sword art online", "sao",
-                            "fate", "fate/stay", "fate grand order", "fgo",
-                            "pokemon", "spy x family", "chainsaw man",
-                            "bleach", "gintama", "hunter x hunter", "hxh",
-                            "fullmetal alchemist", "fma", "code geass",
-                            "steins;gate", "cowboy bebop", "neon genesis evangelion",
-                            "evangelion", "one punch man", "opm", "mob psycho 100",
-                            "tokyo ghoul", "parasyte", "death note",
-                            "soul eater", "black butler", "kuroshitsuji",
-                            "noragami", "blue exorcist", "ao no exorcist",
-                            "magi", "akame ga kill", "kill la kill",
-                            "gurren lagann", "durarara",
-                            "baccano", "monogatari", "kara no kyoukai",
-                            "overlord", "that time i got reincarnated as a slime",
-                            "tensei shitara slime datta ken", "slime",
-                            "mushoku tensei", "jobless reincarnation",
-                            "the rising of the shield hero", "tate no Yuusha",
-                            "konosuba", "kono subarashii",
-                            "reincarnated as a sword",
-                            "tensei shitara ken deshita", "blade",
-                            "the wrong way to use healing magic",
-                            "healing magic no wrong use",
-                            "solo leveling", "omniscient reader",
-                            "orv", "tbate", "trash of the count's family",
-                            "tcf", "lcf", "lout of count's family",
-                            "survival story in a fantasy world",
-                            "apothecary diary", "kusuriya no hitorigoto",
-                            "honey lemon soda", "honey and lemon",
-                            "the apothecary diaries")
+            # Auto-detect anime style for non-"from" prompts
+            # Instead of a fixed keyword list, use a broader approach:
+            # if the user mentions "from <show>" or uses anime-style terms,
+            # boost the prompt with anime quality parameters.
+            # Anime style terms (hoisted to ANIME_STYLE_TERMS at module level)
             
-            is_anime = any(kw in prompt.lower() for kw in anime_keywords)
+            is_anime = any(kw in prompt.lower() for kw in ANIME_STYLE_TERMS)
             
-            if is_anime and not from_match:
-                enhanced = f"{prompt} (anime style, high quality, detailed, vibrant colors, professional artwork, character design, official art)"
-                prompt = enhanced
+            # Ask the fast model whether this is an anime request. It knows
+            # every series in existence, so a keyword list is the fallback
+            # rather than the rule - and when the fast model is offline the
+            # keyword list still catches the obvious ones.
+            llm_anime = await asyncio.to_thread(fastai.is_anime_prompt, prompt)
+            if llm_anime is True:
+                is_anime = True
+            elif llm_anime is False:
+                is_anime = False
             
-            image_url = (
-                f"https://image.pollinations.ai/prompt/"
-                f"{urllib.parse.quote(prompt)}"
-                f"?width=512&height=512&nologo=true&enhance=true&noWatermark=true"
-                f"&model=flux&quality=high"
-            )
-            sent, error = await _send_image(message.channel, image_url, f"Here's what I drew: {prompt[:80]}")
-            if sent is not None:
-                print(f"Discord bot: sent image for '{prompt[:40]}...'")
+            # Support EVERY anime: if user says "from <anything>" or uses
+            # anime-style terms, boost the prompt with quality parameters.
+            # The "from" pattern already handles character+show format.
+            # For other prompts, check if they look like anime requests.
+            looks_anime = is_anime or from_match or "anime" in prompt.lower()
+            
+            if looks_anime and not from_match:
+                enhanced_prompt = (
+                    f"{prompt} (anime style, high quality, detailed, vibrant colors, "
+                    f"professional artwork, character design, official art, "
+                    f"sharp focus, studio quality, 4K detail)"
+                )
+            
+            # Try models for best results (flux-pro/realisticVision require payment)
+            models_to_try = [
+                ("flux", "high"),
+            ]
+            
+            for model_name, quality in models_to_try:
+                try:
+                    image_url = (
+                        f"https://image.pollinations.ai/prompt/"
+                        f"{urllib.parse.quote(enhanced_prompt)}"
+                        f"?width=512&height=512&nologo=true&enhance=true&noWatermark=true"
+                        f"&model={model_name}&quality={quality}"
+                    )
+                    sent, error = await _send_image(message.channel, image_url, f"Here's what I drew: {enhanced_prompt[:80]}")
+                    if sent is not None:
+                        print(f"Discord bot: sent image via {model_name} for '{prompt[:40]}...'")
+                        break
+                    print(f"Discord bot: {model_name} failed: {error}")
+                except Exception as e:
+                    print(f"Discord bot: {model_name} error: {e}")
+                    continue
             else:
-                await message.channel.send(f"Sorry, I couldn't draw that: {error}")
+                await message.channel.send(f"Sorry, I couldn't draw that - all models failed.", allowed_mentions=NO_PINGS)
             return
     # She is not being spoken to. It is in the room now and in the thought that
     # runs next; answering it here would spend a minute of the model on a message
@@ -1587,7 +1676,7 @@ async def _handle_message(message):
                     joined_now = True
                     print(f"Discord bot: joined voice in guild {guild_id} because {label} is there")
                     try:
-                        await message.channel.send(f"Joined {author.voice.channel.name} - I will speak there now 💕")
+                        await message.channel.send(f"Joined {author.voice.channel.name} - I will speak there now 💕", allowed_mentions=NO_PINGS)
                     except Exception:
                         pass
                 else:
@@ -1630,11 +1719,7 @@ async def _handle_message(message):
                             print("Discord bot: voice reply error:", e)
                     listen_task = asyncio.create_task(voice_listen(author.voice.channel, _on_speech))
                     try:
-                        ok = await asyncio.wait_for(listen_task, timeout=2.0)
-                        if not ok:
-                            print(f"Discord bot: voice_listen failed for auto-join guild={guild_id}")
-                    except asyncio.TimeoutError:
-                        print(f"Discord bot: voice_listen timed out for auto-join guild={guild_id}")
+                        await listen_task
                     except Exception as e:
                         print(f"Discord bot: voice_listen error for auto-join guild={guild_id}: {e}")
     # Chat reader: if enabled for this channel and we're in voice, read the message aloud
@@ -1899,8 +1984,9 @@ def main():
     intents = discord.Intents.default()
     intents.message_content = True
     _client = discord.Client(intents=intents)
-    tree = app_commands.CommandTree(_client)
-    register_slash_commands(tree)
+    global _tree
+    _tree = app_commands.CommandTree(_client)
+    register_slash_commands(_tree)
 
     _client.event(on_ready)
     _client.event(on_message)
@@ -1910,9 +1996,8 @@ def main():
     # avatar and no animation loop, because there is no window to animate.
     # controller.start_runtime(connect_avatar=False, animate_parameters=False)
 
-    print("[BOT] _take_over_from_other_bots SKIPPED for testing")
-    # if not _take_over_from_other_bots():
-    #     return 1
+    if not _take_over_from_other_bots():
+        return 1
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -1925,8 +2010,8 @@ def main():
         import traceback
         traceback.print_stack(frame)
     
-    # signal.signal(signal.SIGTERM, signal_handler)
-    # signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
 
     # def handle_exception(loop, context):
     #     msg = context.get("exception", context["message"])
@@ -1938,8 +2023,8 @@ def main():
     # loop.set_exception_handler(handle_exception)
 
     async def run():
-        # loop.add_signal_handler(signal.SIGINT, lambda: loop.create_task(shutdown(_client)))
-        # loop.add_signal_handler(signal.SIGTERM, lambda: loop.create_task(shutdown(_client)))
+        loop.add_signal_handler(signal.SIGINT, lambda: loop.create_task(shutdown(_client)))
+        loop.add_signal_handler(signal.SIGTERM, lambda: loop.create_task(shutdown(_client)))
         print("[BOT] about to start client...")
         try:
             await _client.start(token)
@@ -1996,10 +2081,6 @@ def main():
         _disarm_watchdog()
         print("Discord bot: stopped")
     print("[BOT] main() returning", code)
-    if code == 0 and _client and _client.is_connected():
-        print("[BOT] starting keepalive...")
-        import threading
-        threading.Thread(target=_keepalive, daemon=True).start()
     return code
 
 

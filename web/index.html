@@ -1003,7 +1003,7 @@ html[data-char="mochi"] .brand em{color:var(--icon)}
       note:'Kookie sends your message and the chat so far to your AI. Your AI can pass it to Claude, OpenAI or your own model and send the answer back here. Replies in OpenAI format, or with a <code>reply</code>, <code>response</code>, <code>text</code> or <code>answer</code> field, all work. Your server must allow requests from this page (CORS). Leave the model name empty to let your AI choose.'}
   };
   var $ = function(id){return document.getElementById(id)};
-  var state = {provider:'custom', cfg:null, history:[], busy:false, gen:0};
+  var state = {provider:'custom', cfg:null, history:[], busy:false, gen:0, remembered:0};
   window.__kookie = {state:state, callAI:callAI, explain:explain, readForm:function(){return readForm();}};
 
   function setProvider(p, keepValues){
@@ -1163,6 +1163,24 @@ html[data-char="mochi"] .brand em{color:var(--icon)}
   });
 
   /* chat */
+  function kookieAccessKey(){
+    try{ return localStorage.getItem('kookie_access') || sessionStorage.getItem('kookie_access') || ''; }catch(e){ return ''; }
+  }
+  var _visitorId = null;
+  function kookieVisitorId(){
+    // A browser's own id, so a visitor who comes back finds their
+    // own conversation and nobody else's.
+    if(_visitorId) return _visitorId;
+    var id = null;
+    try{ id = localStorage.getItem('kookie_visitor'); }catch(e){ id = null; }
+    if(!id){
+      id = (window.crypto && crypto.randomUUID) ? crypto.randomUUID()
+           : (Date.now().toString(16) + '-' + Math.random().toString(16).slice(2));
+      try{ localStorage.setItem('kookie_visitor', id); }catch(e){}
+    }
+    _visitorId = id;
+    return id;
+  }
   function renderLog(){
     var log = $('log'); log.innerHTML = '';
     if(!state.history.length){
@@ -1190,6 +1208,7 @@ html[data-char="mochi"] .brand em{color:var(--icon)}
     var input = $('input'), text = input.value.trim();
     if(!text) return;
     if(!state.cfg){ addBubbleEmpty(); setStatus('Connect your AI first.', 'err'); document.getElementById('connect').scrollIntoView({behavior:'smooth'}); return; }
+    if(!kookieAccessKey()){ setStatus("You need Kookie's access key to talk to her.", 'err'); document.getElementById('connect').scrollIntoView({behavior:'smooth'}); return; }
     if(!state.history.length) $('log').innerHTML='';
     if(window.__kookieStop) window.__kookieStop();
     input.value=''; autosize();
@@ -1201,13 +1220,16 @@ html[data-char="mochi"] .brand em{color:var(--icon)}
       // Use server relay so Kookie's personality is applied
       var key = localStorage.getItem('kookie_access') || sessionStorage.getItem('kookie_access');
       var payload = {cfg: state.cfg, messages: state.history.slice()};
-      // If family key user, include Discord ID
+      // If family key user, include Discord ID - in a header, which
+      // is where the server looks for it. A claim in the body could
+      // have been written by anybody.
       var familyId = localStorage.getItem('kookie_family_id') || sessionStorage.getItem('kookie_family_id');
-      if(familyId) payload.family = {discord: familyId};
+      var headers = {'content-type':'application/json', 'x-kookie-key': key};
+      if(familyId) headers['x-kookie-discord'] = familyId;
       var apiBase = (window.KOOKIE_API_BASE || '').replace(/\/+$/, '');
       var res = await fetch(apiBase + '/api/provider', {
         method: 'POST',
-        headers: {'content-type': 'application/json', 'x-kookie-key': key},
+        headers: headers,
         body: JSON.stringify(payload)
       });
       var data = await res.json();
@@ -1217,15 +1239,21 @@ html[data-char="mochi"] .brand em{color:var(--icon)}
       state.history.push({role:'assistant',content:reply});
       window.__kookieRender(wait.querySelector('.t'), reply); window.__kookieCopy(wait, reply);
       if(window.__kookieSpeak) window.__kookieSpeak(reply);
-      // Save chat to server memory for training
+      // Save chat to server memory for training. Only what is new
+      // goes: the whole chat is not posted again every time.
       if(state.cfg){
         var key = localStorage.getItem('kookie_access') || sessionStorage.getItem('kookie_access');
-        var rememberPayload = {visitor: key ? 'family' : 'stranger', messages: state.history.slice()};
-        fetch((apiBase || '') + '/api/remember', {method:'POST', headers:{'content-type':'application/json', 'x-kookie-key': key}, body: JSON.stringify(rememberPayload)}).catch(function(){});
+        var fresh = state.history.slice(state.remembered || 0);
+        state.remembered = state.history.length;
+        if(fresh.length){
+          var rememberPayload = {visitor: kookieVisitorId(), messages: fresh};
+          fetch((apiBase || '') + '/api/remember', {method:'POST', headers:{'content-type':'application/json', 'x-kookie-key': key}, body: JSON.stringify(rememberPayload)}).catch(function(){});
+        }
       }
     }catch(err){
       if(gen !== state.gen) return;
       state.history.pop();
+      state.remembered = Math.min(state.remembered || 0, state.history.length);
       if(userRow && userRow.parentNode) userRow.parentNode.removeChild(userRow);
       if(!input.value){ input.value = text; autosize(); }
       wait.className = 'msg ai err'; wait.querySelector('.t').textContent = explain(err);
@@ -1236,7 +1264,7 @@ html[data-char="mochi"] .brand em{color:var(--icon)}
   $('sendBtn').addEventListener('click', send);
   $('input').addEventListener('input', autosize);
   $('input').addEventListener('keydown', function(e){ if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); send(); } });
-  $('clearBtn').addEventListener('click', function(){ state.gen++; state.history=[]; if(window.__kookieStop) window.__kookieStop(); renderLog(); });
+  $('clearBtn').addEventListener('click', function(){ state.gen++; state.history=[]; state.remembered=0; if(window.__kookieStop) window.__kookieStop(); renderLog(); });
   $('historyBtn').addEventListener('click', async function(){
     var apiBase = (window.KOOKIE_API_BASE || '').replace(/\/+$/, '');
     var key = localStorage.getItem('kookie_access') || sessionStorage.getItem('kookie_access');
@@ -1288,7 +1316,7 @@ html[data-char="mochi"] .brand em{color:var(--icon)}
 <script>
 (function(){
   var GET_KEY_URL='https://discord.gg/shH4rhgCwv';  // put the link where people can get a key, for example your Discord invite
-  var HASHES=['3044461514aaa3c8fa463724e9f4b3c47ec3daca65220022936271a2cd8fbe63', '9e6a7eae819da0d02f29e92375ad16d58883f9b5333d17e5c7bb7eec4c406b84'];
+  var HASHES=['__SET_IN_ENV__', '9e6a7eae819da0d02f29e92375ad16d58883f9b5333d17e5c7bb7eec4c406b84'];  // '__SET_IN_ENV__' = family key hash removed - the key was compromised and MUST be rotated, then re-added here
   function ok(h){ return HASHES.indexOf(h)>-1; }
   var body=document.body, input=document.getElementById('gateKey'), discordInput=document.getElementById('gateDiscord'), msg=document.getElementById('gateMsg');
   document.querySelector('.gate-img').src=document.querySelector('.brand img').src;
@@ -1379,7 +1407,7 @@ html[data-char="mochi"] .brand em{color:var(--icon)}
     catch(err){ msg.textContent='This browser could not check the key. Reload the page and try again.'; return; }
     if(ok(h)){
       var discordId = discordInput.value.trim();
-      var isFamilyKey = h === '3044461514aaa3c8fa463724e9f4b3c47ec3daca65220022936271a2cd8fbe63';
+      var isFamilyKey = h === '__SET_IN_ENV__';  // family key hash removed - key MUST be rotated, then re-added here
       var isStrangerKey = h === '9e6a7eae819da0d02f29e92375ad16d58883f9b5333d17e5c7bb7eec4c406b84';
       
       if(isFamilyKey){
@@ -1425,7 +1453,7 @@ html[data-char="mochi"] .brand em{color:var(--icon)}
 (function(){
   /* Developer options. Add one SHA-256 hash per allowed developer Discord ID. */
   var DEV_ID_HASHES = ['30f265a5218592bdcdbb5e87f20369732bedd3f3171d35720f4116ca717303cd', '63c2317e76f36b45b7ef55dec459e38a618d5e6b6bbed0a3f8224901233d3122'];
-  var DEV_PW_HASH = '3044461514aaa3c8fa463724e9f4b3c47ec3daca65220022936271a2cd8fbe63';
+  var DEV_PW_HASH = '__SET_IN_ENV__';  // dev password hash removed (it was the family key) - key MUST be rotated, then re-added here
   var $ = function(id){return document.getElementById(id)};
   var verifiedId = false, unlocked = false, fails = 0, lockedUntil = 0, errors = [];
 

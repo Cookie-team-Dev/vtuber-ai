@@ -26,6 +26,7 @@ import os
 import re
 import threading
 import time
+import logging
 
 from memory import _contains_slur
 
@@ -48,6 +49,8 @@ OWN_MIND_CHAR_BUDGET = 2100
 # the file without bound or make the prompt crawl.
 MAX_WEB_FACTS = 200
 MAX_OPINIONS = 60
+MAX_PREFERENCES = 60
+MAX_GOALS = 60
 MAX_CLAIM_CHARS = 220
 MAX_TOPIC_CHARS = 80
 
@@ -203,6 +206,16 @@ def load(filepath=None):
                 rows = data.get(key)
                 if isinstance(rows, list):
                     _state[key] = [row for row in rows if isinstance(row, dict)]
+            if len(_state["facts"]) > MAX_WEB_FACTS:
+                _state["facts"] = _state["facts"][-MAX_WEB_FACTS:]
+            if len(_state["opinions"]) > MAX_OPINIONS:
+                _state["opinions"] = _state["opinions"][-MAX_OPINIONS:]
+            if len(_state["preferences"]) > MAX_PREFERENCES:
+                _state["preferences"] = _state["preferences"][-MAX_PREFERENCES:]
+            if len(_state["goals"]) > MAX_GOALS:
+                _state["goals"] = _state["goals"][-MAX_GOALS:]
+            if len(_state["corpus"]) > MAX_CORPUS_ROWS:
+                _state["corpus"] = _state["corpus"][-MAX_CORPUS_ROWS:]
             stats = data.get("stats")
             if isinstance(stats, dict):
                 _state["stats"] = {
@@ -216,6 +229,7 @@ def load(filepath=None):
             for row in _state["corpus"]:
                 _remember_corpus_key(row)
     except (OSError, ValueError, TypeError):
+        logging.exception("learning: failed to load state")
         return
 
 
@@ -253,7 +267,7 @@ def _remember_corpus_key(row):
     return key
 
 
-def _add_corpus_row(role, text, source="", turns=None, meta=None):
+def _add_corpus_row(role, text, source="", turns=None, meta=None, topic=""):
     """One training row. This is the corpus the export writes out.
 
     turns is the whole exchange when there is one - a question and its answer -
@@ -281,6 +295,8 @@ def _add_corpus_row(role, text, source="", turns=None, meta=None):
         row["role"] = role
         row["text"] = body
         row["kind"] = "claim"
+        if topic:
+            row["topic"] = _clean_topic(topic)
     with _lock:
         key = _corpus_fingerprint(row)
         if key and key in _corpus_keys:
@@ -292,8 +308,13 @@ def _add_corpus_row(role, text, source="", turns=None, meta=None):
             # The oldest rows go, but the corpus is now mostly seeded material
             # that is still true: a night of browsing must not be able to push
             # every conversation she has ever had out of the file by itself.
+            dropped = _state["corpus"][:-MAX_CORPUS_ROWS]
             _state["corpus"] = _state["corpus"][-MAX_CORPUS_ROWS:]
-            _corpus_keys.clear()
+            for dr in dropped:
+                dk = _corpus_fingerprint(dr)
+                if dk:
+                    _corpus_keys.discard(dk)
+            # ensure keys exist for kept rows
             for kept in _state["corpus"]:
                 _remember_corpus_key(kept)
     return True
@@ -320,20 +341,26 @@ _DISTILL_PROMPT = (
 )
 
 
-def _extract_claims(raw, max_claims):
-    """Pull the claim list out of whatever shape the model answered in."""
+def _extract_json(raw):
     if not raw:
-        return []
-    payload = None
+        return None
     for opener, closer in (("{", "}"), ("[", "]")):
         start = raw.find(opener)
         end = raw.rfind(closer)
         if start != -1 and end > start:
             try:
                 payload = json.loads(raw[start:end + 1])
-                break
+                return payload
             except ValueError:
                 continue
+    return None
+
+
+def _extract_claims(raw, max_claims):
+    """Pull the claim list out of whatever shape the model answered in."""
+    if not raw:
+        return []
+    payload = _extract_json(raw)
     claims = []
     if isinstance(payload, dict):
         for item in payload.get("facts", []) or []:
@@ -378,6 +405,7 @@ def learn_from_web(query, stop_check=None, autonomous=False, timeout=None, pages
                 if stop_check():
                     break
             except Exception:
+                logging.exception("learning: stop_check failed")
                 break
         page = _browse(address)
         if not isinstance(page, str) or not page.strip():
@@ -392,6 +420,7 @@ def learn_from_web(query, stop_check=None, autonomous=False, timeout=None, pages
             num_predict=220,
             temperature=0.3,
             timeout=timeout,
+            json_mode=True,
         )
         for claim in _extract_claims(raw, MAX_CLAIMS_PER_ROUND):
             if _store_fact(claim, topic=query, url=url, title=title):
@@ -409,7 +438,7 @@ def learn_from_web(query, stop_check=None, autonomous=False, timeout=None, pages
         )
     summary = kept[0] if len(kept) == 1 else f"{kept[0]} (and {len(kept) - 1} more)"
     for claim in kept:
-        _add_corpus_row("kookie", claim, source=query)
+        _add_corpus_row("kookie", claim, source=query, topic=query)
     return (
         f"She looked up '{query}', read {read} page{'' if read == 1 else 's'} and kept "
         f"{len(kept)} thing{'' if len(kept) == 1 else 's'}: {summary}"
@@ -446,7 +475,10 @@ def _search_addresses(query, pages):
     if addresses:
         return addresses
     # A search that handed back no addresses still deserves one read of its own.
-    return [query]
+    q = str(query or "").strip()
+    if re.match(r"https?://", q, re.IGNORECASE):
+        return [q]
+    return []
 
 
 def _host_of(address):
@@ -483,7 +515,7 @@ def _store_fact(claim, topic="", url="", title=""):
     she keeps in her head, and it never goes back into a prompt.
     """
     if _contains_slur(claim) or _contains_slur(topic) or _contains_slur(title) or _contains_slur(url):
-        print("learning: refused to store a fact containing a slur")
+        logging.warning("learning: refused to store a fact containing a slur")
         return False
     key = _dedupe_key(claim)
     if not key:
@@ -571,6 +603,7 @@ def form_opinion(topic, timeout=None):
         num_predict=180,
         temperature=0.9,
         timeout=timeout,
+        json_mode=True,
     )
     parsed = _json_object(raw)
     opinion = _clean_claim(parsed.get("opinion"))
@@ -590,7 +623,7 @@ def form_opinion(topic, timeout=None):
         })
         if len(_state["opinions"]) > MAX_OPINIONS:
             _state["opinions"] = _state["opinions"][-MAX_OPINIONS:]
-    _add_corpus_row("kookie", opinion, source="own opinion")
+    _add_corpus_row("kookie", opinion, source="own opinion", topic=about)
     return f"On {about}, she thinks: {opinion}"
 
 
@@ -604,7 +637,7 @@ def choose_for_herself(timeout=None):
     if not _wired():
         return "She cannot decide anything right now - the model is not wired in."
     raw = _complete(_PREFERENCE_SYSTEM, _PREFERENCE_PROMPT, num_predict=200,
-                    temperature=0.95, timeout=timeout)
+                    temperature=0.95, timeout=timeout, json_mode=True)
     parsed = _json_object(raw)
     kept = []
     preference = _clean_claim(parsed.get("preference"))
@@ -628,28 +661,25 @@ def _store_own(bucket, text):
     arrived as a quote.
     """
     if _contains_slur(text):
-        print("learning: refused to store an own conclusion containing a slur")
+        logging.warning("learning: refused to store an own conclusion containing a slur")
         return False
     with _lock:
         key = _dedupe_key(text)
         if any(_dedupe_key(row.get("text")) == key for row in _state[bucket]):
             return False
         _state[bucket].append({"text": text, "created_at": time.time()})
+        if bucket == "preferences" and len(_state[bucket]) > MAX_PREFERENCES:
+            _state[bucket] = _state[bucket][-MAX_PREFERENCES:]
+        if bucket == "goals" and len(_state[bucket]) > MAX_GOALS:
+            _state[bucket] = _state[bucket][-MAX_GOALS:]
         return True
 
 
 def _json_object(raw):
-    if not raw:
-        return {}
-    start = raw.find("{")
-    end = raw.rfind("}")
-    if start == -1 or end <= start:
-        return {}
-    try:
-        parsed = json.loads(raw[start:end + 1])
-    except ValueError:
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
+    payload = _extract_json(raw)
+    if isinstance(payload, dict):
+        return payload
+    return {}
 
 
 # ------------------------------------------------------------- what she knows
@@ -905,8 +935,10 @@ def _seed_from_memory(path=None, limit=None):
         if len(reply) < _MIN_USER_CHARS or any(marker in lowered for marker in _JUNK_REPLIES):
             continue
         # A pasted file or a wall of text is not something to learn a turn from.
-        if len(asked) > 800 or len(reply) > MAX_SEEDED_TEXT_CHARS:
-            continue
+        if len(asked) > 800:
+            asked = asked[:800]
+        if len(reply) > MAX_SEEDED_TEXT_CHARS:
+            reply = reply[:MAX_SEEDED_TEXT_CHARS]
         meta = {"emotion": emotion} if emotion else None
         if _add_corpus_row(
             "kookie", reply, source="conversation",
@@ -1067,7 +1099,9 @@ def record_exchange(user_text, reply_text, emotion="", source="conversation"):
     if len(user_text) < _MIN_USER_CHARS or len(reply) < _MIN_USER_CHARS:
         return False
     if len(user_text) > 800:
-        return False
+        user_text = user_text[:800]
+    if len(reply) > MAX_SEEDED_TEXT_CHARS:
+        reply = reply[:MAX_SEEDED_TEXT_CHARS]
     lowered = reply.lower()
     if any(marker in lowered for marker in _JUNK_REPLIES):
         return False

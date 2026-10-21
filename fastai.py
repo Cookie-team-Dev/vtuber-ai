@@ -203,26 +203,49 @@ def keys_for(env_var):
     return keys
 
 
+def _env_int(name, default):
+    """An integer setting from the environment, or the default when it is not one.
+
+    A typo in the value used to raise a ValueError while this module was being
+    imported, which took the whole bot down with it - the local model and every
+    other module that imports this one. A bad number in one setting is a
+    configuration mistake, not a reason for the bot not to start.
+    """
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"fastai: {name}={raw!r} is not a number, using {default}")
+        return default
+
+
 # Which key answered last, per provider, so the next reply tries that one first.
 # With six keys where five share a spent quota this is worth 2s and five lines of
 # log per message: without it every reply walks the dead ones first, and the walk
 # is only avoided while their cooldowns last.
 _KEY_PREFERENCE = {}
-_KEY_PREFERENCE_LOCK = threading.Lock()
 
 # How much of a key's daily allowance to spend before moving on to the next one.
 # The free tier is 500 requests a day for GenerateRequestsPerDayPerProjectPerModel,
 # measured here as a hard refusal rather than a slowdown, so the last slice is
 # left alone: a key that runs out mid-conversation stops the reply instead of
 # slowing it, and there is no way to ask Google where the line is before the 429.
-KEY_DAILY_BUDGET = int((os.environ.get("KOOKIE_KEY_DAILY_REQUESTS") or "400"))
+KEY_DAILY_BUDGET = _env_int("KOOKIE_KEY_DAILY_REQUESTS", 400)
 # The hour a key's allowance starts over. Measured here from the 429s: every one
 # of them said the quota was back between 07:00 and 08:00 Cambodia time, not at
 # midnight, so a counter that resets at midnight hands a key back seven hours
 # early and collects a refusal for each reply in between.
-QUOTA_RESET_HOUR = int((os.environ.get("KOOKIE_QUOTA_RESET_HOUR") or "7"))
+QUOTA_RESET_HOUR = _env_int("KOOKIE_QUOTA_RESET_HOUR", 7)
 _KEY_USAGE = {}
-_KEY_USAGE_LOCK = threading.Lock()
+
+# One lock for the key state rather than one per table. The tables are read and
+# written together - a key that answers is preferred, counted and has its
+# cooldown lifted - and three separate locks let two threads interleave a
+# half-updated state. It is reentrant because the helpers below call each other
+# while holding it.
+_KEY_STATE_LOCK = threading.RLock()
 
 
 def _quota_window():
@@ -238,21 +261,16 @@ def _quota_window():
     return (now.tm_yday, hours)
 
 
-def _preferred_slot(env_var):
-    with _KEY_PREFERENCE_LOCK:
-        return _KEY_PREFERENCE.get(env_var)
-
-
 def _prefer_key(slot):
     env_var = slot.split("#", 1)[0]
-    with _KEY_PREFERENCE_LOCK:
+    with _KEY_STATE_LOCK:
         _KEY_PREFERENCE[env_var] = slot
 
 
 def _key_use(slot):
     """How many replies this key has answered in the current allowance window."""
     window = _quota_window()
-    with _KEY_USAGE_LOCK:
+    with _KEY_STATE_LOCK:
         seen, count = _KEY_USAGE.get(slot, (None, 0))
         return count if seen == window else 0
 
@@ -260,7 +278,7 @@ def _key_use(slot):
 def _note_key_use(slot):
     """Count one answered reply against this key's window, so it is retired in time."""
     window = _quota_window()
-    with _KEY_USAGE_LOCK:
+    with _KEY_STATE_LOCK:
         seen, count = _KEY_USAGE.get(slot, (None, 0))
         _KEY_USAGE[slot] = (window, count + 1 if seen == window else 1)
 
@@ -313,23 +331,35 @@ def _providers():
                 "pinned": bool(chosen),
                 "label": label,
             })
-    for env_var in {entry["env_var"] for entry in found}:
-        # Only this provider's keys move, and only inside their own group: another
-        # provider stays where it was in PROVIDERS. Inside the group the order is
-        # keys that still have room today, then the key with the most of its day
-        # left, then the one that answered last, then the order they were written
-        # in. Moving on from a key that is nearly spent is the point: the switch
-        # happens while she can still answer, rather than after a refusal that
-        # costs a whole reply.
-        group = sorted(
-            (e for e in found if e["env_var"] == env_var),
+    # Only this provider's keys move, and only inside their own group: another
+    # provider stays where it was in PROVIDERS. Inside the group the order is
+    # keys that still have room today, then the key with the most of its day
+    # left, then the one that answered last, then the order they were written
+    # in. Moving on from a key that is nearly spent is the point: the switch
+    # happens while she can still answer, rather than after a refusal that
+    # costs a whole reply.
+    #
+    # The providers keep the order they were configured in. They used to be
+    # walked through a set, whose order is whatever the hash happens to be on
+    # this run, so Groq was sometimes tried before Gemini for no reason at all.
+    groups = {}
+    order = []
+    for entry in found:
+        env_var = entry["env_var"]
+        if env_var not in groups:
+            groups[env_var] = []
+            order.append(env_var)
+        groups[env_var].append(entry)
+    ordered = []
+    for env_var in order:
+        ordered.extend(sorted(
+            groups[env_var],
             key=lambda e: (
                 1 if _key_use(e["slot"]) >= KEY_DAILY_BUDGET else 0,
                 e["key_number"],
             ),
-        )
-        found = [e for e in found if e["env_var"] != env_var] + group
-    return found
+        ))
+    return ordered
 
 
 def _provider():
@@ -375,6 +405,12 @@ def _translate(messages):
     translated = []
     # Calls made and not yet answered, oldest first: (name, id).
     pending = []
+    # A counter for the ids made up here, because the number of unanswered
+    # calls is not an id: it goes back down as the results come in, so two calls
+    # in one conversation were both handed "call_1" and the two results could
+    # not be told apart.
+    call_seq = 0
+    used_ids = set()
     for message in messages:
         entry = dict(message)
         if entry.get("role") == "tool":
@@ -386,7 +422,14 @@ def _translate(messages):
             calls = []
             for call in entry["tool_calls"]:
                 function = call.get("function") or {}
-                call_id = str(call.get("id") or f"call_{len(pending)}")
+                call_id = str(call.get("id") or "").strip()
+                if not call_id:
+                    call_seq += 1
+                    call_id = f"call_{call_seq}"
+                    while call_id in used_ids:
+                        call_seq += 1
+                        call_id = f"call_{call_seq}"
+                used_ids.add(call_id)
                 pending.append((function.get("name", ""), call_id))
                 calls.append({
                     "id": call_id,
@@ -500,6 +543,47 @@ def _gemini_contents(messages):
     return system, contents
 
 
+# Anything that looks like a key or a token is redacted before a provider's
+# answer goes into a log: the body of an error is not ours to print, and a
+# provider that echoes the request back does not get to print our key with it.
+_SECRET_PATTERN = re.compile(
+    r"(?i)\b(?:sk|api[_-]?key|key|token|bearer|aiza)[-_: =]*[A-Za-z0-9_\-]{8,}"
+)
+
+
+def _safe_error_text(response, limit=200):
+    """A short, sanitized description of what the provider said.
+
+    The status code and the provider's own message are enough to tell one
+    failure from another. The raw body is not, and it is the part that ends up
+    in a log that gets pasted around, so it is reduced to a message with
+    anything key-shaped taken out of it.
+    """
+    message = ""
+    try:
+        parsed = response.json()
+    except Exception:
+        parsed = None
+    if isinstance(parsed, dict):
+        error = parsed.get("error")
+        if isinstance(error, dict):
+            message = str(error.get("message") or "")
+        elif error:
+            message = str(error)
+        if not message:
+            message = str(parsed.get("message") or "")
+    if not message:
+        try:
+            message = " ".join((response.text or "").split())
+        except Exception:
+            message = ""
+    message = _SECRET_PATTERN.sub("<redacted>", message)
+    message = " ".join(message.split())
+    if len(message) > limit:
+        message = message[:limit].rstrip() + "..."
+    return message or "no message"
+
+
 def _chat_gemini_native(provider, model, messages, tools, tool_choice, max_tokens,
                        temperature, top_p, timeout, json_mode):
     """One tool-calling turn against Gemini's own API rather than the compat one."""
@@ -552,7 +636,8 @@ def _chat_gemini_native(provider, model, messages, tools, tool_choice, max_token
         raise _TryNext(f"{model} is not on {provider['label']} any more")
     if response.status_code >= 400:
         raise FastAIError(
-            f"{provider['label']} answered {response.status_code}: {response.text[:200]}"
+            f"{provider['label']} answered {response.status_code}: "
+            f"{_safe_error_text(response)}"
         )
 
     try:
@@ -586,7 +671,7 @@ def _chat_gemini_native(provider, model, messages, tools, tool_choice, max_token
 
 
 def _ask_one(provider, model, messages, tools, tool_choice, max_tokens,
-             temperature, top_p, timeout, json_mode):
+             temperature, top_p, timeout, stop, json_mode):
     """One attempt against one model, in whichever shape that provider wants."""
     if tools and provider["label"] == "Gemini":
         return _chat_gemini_native(
@@ -594,11 +679,12 @@ def _ask_one(provider, model, messages, tools, tool_choice, max_tokens,
             temperature, top_p, timeout, json_mode,
         )
     return _ask(provider, model, _translate(messages), tools, tool_choice, max_tokens,
-                temperature, top_p, timeout, stop=None, json_mode=json_mode)
+                temperature, top_p, timeout, stop, json_mode)
 
 
 def _try_provider_fallbacks(provider, models, messages, tools, tool_choice,
-                          max_tokens, temperature, top_p, timeout, json_mode, last_error):
+                          max_tokens, temperature, top_p, timeout, stop, json_mode,
+                          last_error):
     """Try the rest of one provider's list after the named model ran out of room.
 
     Stays inside the provider on purpose. Being told "use Gemini" is not consent
@@ -609,11 +695,10 @@ def _try_provider_fallbacks(provider, models, messages, tools, tool_choice,
     slot = provider.get("slot", "")
     # Check if the original error was a hard quota - if so, the whole key is out
     original_was_quota = _is_hard_quota(last_error) or _is_quota(last_error)
-    last_error = last_error
     for model in _skip_exhausted(models, slot):
         try:
             answer = _ask_one(provider, model, messages, tools, tool_choice, max_tokens,
-                              temperature, top_p, timeout, json_mode)
+                              temperature, top_p, timeout, stop, json_mode)
         except _TryNext as skip:
             last_error = skip
             if _is_hard_quota(skip):
@@ -658,13 +743,17 @@ def chat(messages, tools=None, tool_choice=None, max_tokens=512, temperature=0.8
                 temperature, top_p, timeout, stop, json_mode,
             )
         except FastAIError as error:
-            # Only the failures that belong to this key earn the next one. A
-            # malformed request or an unreadable reply happens the same way
-            # through every key, so walking past those would just turn one real
-            # error into several and make the wait longer.
+            # Every failure earns the next entry in the list. That entry is
+            # either another key of this provider or another provider
+            # entirely, and the whole point of the list is that one of them
+            # can answer. The old code gave up on all of them the moment the
+            # error was not about the key, so a provider that was briefly down
+            # took the whole reply with it and the local model answered.
             last_error = error
-            if not _is_key_problem(error):
-                raise
+            if isinstance(error, _KeyOutOfRoom):
+                # Nothing was even asked of this key, so there is nothing to
+                # report: the next entry is simply the next place to try.
+                continue
             later = next(
                 (
                     other for other in providers
@@ -673,14 +762,21 @@ def chat(messages, tools=None, tool_choice=None, max_tokens=512, temperature=0.8
                 ),
                 None,
             )
+            reason = (
+                "this key cannot serve it" if _is_key_problem(error)
+                else "the provider did not answer"
+            )
             if later is None:
-                raise
-            if isinstance(error, _KeyOutOfRoom):
+                print(
+                    f"{provider['label']} key {provider['key_number']} of "
+                    f"{provider['key_count']} cannot serve this ({reason}): "
+                    f"{error}. Moving to the next provider."
+                )
                 continue
             print(
                 f"{provider['label']} key {provider['key_number']} of "
-                f"{provider['key_count']} cannot serve this: {error}. Moving to "
-                f"key {later['key_number']}."
+                f"{provider['key_count']} cannot serve this ({reason}): {error}. "
+                f"Moving to key {later['key_number']}."
             )
     raise FastAIError(str(last_error))
 
@@ -722,6 +818,12 @@ def _chat_one_key(provider, messages, tools, tool_choice, max_tokens,
             if _is_hard_quota(skip):
                 _note_quota(model, skip, slot)
             continue
+        except FastAIError as error:
+            # A timeout, a refused request or an unreadable reply: this model
+            # could not answer, but the next one on the list might. Letting that
+            # out of the loop gave up on the whole key over one bad reply.
+            last_error = error
+            continue
         _note_working(model, slot)
         return answer
     if provider["pinned"]:
@@ -740,7 +842,7 @@ def _chat_one_key(provider, messages, tools, tool_choice, max_tokens,
             return _try_provider_fallbacks(
                 provider, [m for m in provider.get("fallbacks", ()) if m not in provider["models"]],
                 messages, tools, tool_choice, max_tokens, temperature, top_p, timeout,
-                json_mode, last_error,
+                stop, json_mode, last_error,
             )
         raise FastAIError(str(last_error))
     if not tried:
@@ -942,7 +1044,6 @@ RATE_LIMIT_FOR_SECONDS = 75
 # a long time to not try a model because one number in a 429 said so.
 EXHAUSTED_MAX_SECONDS = 3600
 _exhausted_until = {}
-_exhausted_lock = threading.Lock()
 
 
 def _quota_key(slot, model):
@@ -959,16 +1060,37 @@ def _quota_key(slot, model):
 
 
 def _skip_exhausted(models, slot=""):
-    """The candidates worth asking right now, in order."""
+    """The candidates worth asking right now, in order.
+
+    Only the entries being asked about are looked at. Sweeping the whole
+    table on every call made every reply pay for every key's cooldowns, and
+    the table's own expiry does the rest of the work: an entry whose time has
+    passed is not in the way any more.
+    """
     now = time.monotonic()
-    with _exhausted_lock:
-        stale = [name for name, until in _exhausted_until.items() if until <= now]
-        for name in stale:
-            del _exhausted_until[name]
+    with _KEY_STATE_LOCK:
         return [
             name for name in models
-            if _quota_key(slot, name) not in _exhausted_until
+            if _exhausted_until.get(_quota_key(slot, name), 0.0) <= now
         ]
+
+
+# How often the cooldown table is swept of the entries whose time has passed.
+# The sweep used to happen on every _skip_exhausted call, which put the whole
+# table on the hot path of every reply; doing it once every so often on a write
+# keeps the table small without that cost.
+SWEEP_EVERY_WRITES = 32
+_sweep_count = 0
+
+
+def _sweep_expired_locked(now):
+    """Drop the cooldown entries whose time has passed. The lock is held."""
+    global _sweep_count
+    _sweep_count += 1
+    if _sweep_count % SWEEP_EVERY_WRITES:
+        return
+    for name in [n for n, until in _exhausted_until.items() if until <= now]:
+        del _exhausted_until[name]
 
 
 # Slots that have refused for quota, so that a key coming back is visible rather
@@ -1012,20 +1134,24 @@ def _note_exhausted(model, seconds=None, slot="", spent=True, floor=None):
     # out, and the key is fine the moment the minute is up.
     wait = max(EXHAUSTED_FOR_SECONDS if floor is None else floor,
                min(seconds, EXHAUSTED_MAX_SECONDS))
-    with _exhausted_lock:
-        _exhausted_until[_quota_key(slot, model)] = time.monotonic() + wait
-    if slot and spent:
-        _KEY_WAS_SPENT.add(slot)
+    now = time.monotonic()
+    with _KEY_STATE_LOCK:
+        _exhausted_until[_quota_key(slot, model)] = now + wait
+        _sweep_expired_locked(now)
+        if slot and spent:
+            _KEY_WAS_SPENT.add(slot)
 
 
 def _note_working(model, slot=""):
-    with _exhausted_lock:
+    with _KEY_STATE_LOCK:
         _exhausted_until.pop(_quota_key(slot, model), None)
+        was_spent = bool(slot) and slot in _KEY_WAS_SPENT
+        if was_spent:
+            _KEY_WAS_SPENT.discard(slot)
     if slot:
         _prefer_key(slot)
         _note_key_use(slot)
-        if slot in _KEY_WAS_SPENT:
-            _KEY_WAS_SPENT.discard(slot)
+        if was_spent:
             print(
                 f"{slot} is answering again, so its quota is back and she is on "
                 f"it. With every key sorted by what is left of its day, the one "
@@ -1079,14 +1205,10 @@ def _ask(provider, model, messages, tools, tool_choice, max_tokens, temperature,
         if response.status_code == 429:
             raise _TryNext(_quota_refusal(model, response.text))
         raise _TryNext(f"{model} is not on {provider['label']} any more")
-    if response.status_code == 429:
-        # A free tier running out of room is the expected failure here, not an
-        # outage, and the local model is right there. Say so plainly so the log
-        # explains the sudden slowdown.
-        raise FastAIError(f"{provider['label']} is rate limited right now")
     if response.status_code >= 400:
         raise FastAIError(
-            f"{provider['label']} answered {response.status_code}: {response.text[:200]}"
+            f"{provider['label']} answered {response.status_code}: "
+            f"{_safe_error_text(response)}"
         )
 
     try:
@@ -1103,3 +1225,64 @@ def _ask(provider, model, messages, tools, tool_choice, max_tokens, temperature,
         # streaming path: it means the answer was cut off and is worth retrying.
         "finish_reason": "length" if choice.get("finish_reason") == "length" else "stop",
     }
+
+
+# ---------------------------------------------------------------------------
+# Anime detection
+# ---------------------------------------------------------------------------
+# A keyword list can never hold every anime in existence - there are tens of
+# thousands of series and the list here was already out of date the moment it
+# was written. So this asks the fast model instead, which knows them all. The
+# call is tiny and cached, and on any failure it falls back to the keyword
+# check, so a provider hiccup never costs the user their drawing.
+_ANIME_CACHE = {}
+_ANIME_CACHE_LOCK = threading.Lock()
+
+
+def is_anime_prompt(prompt):
+    """Is this prompt asking for an anime-style image?
+
+    Returns True, False, or None when it cannot tell. The None case is the
+    signal to the caller to fall back to its own keyword list, so this is a
+    strict improvement rather than a replacement: it knows more, and it never
+    knows less.
+
+    The question is asked in one shot rather than "name the show" because a
+    user typing "draw Levi from Attack on Titan" or "make me a waifu" is
+    describing what they want, not testing a catalogue, and a yes/no answer
+    is all the drawing code needs to add the style boost.
+    """
+    if not prompt or not available():
+        return None
+    key = prompt.strip().lower()
+    with _ANIME_CACHE_LOCK:
+        if key in _ANIME_CACHE:
+            return _ANIME_CACHE[key]
+    try:
+        answer = chat(
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You decide whether a user's image prompt is asking for "
+                        "anime, manga, or Japanese cartoon style. Answer exactly "
+                        "one word: YES or NO. A prompt is YES if it names a "
+                        "character or show from any anime or manga, or uses "
+                        "anime-style terms like waifu, kawaii, senpai, or asks "
+                        "for anime art style. It is NO for real people, photos, "
+                        "landscapes, objects, or anything not anime-related."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=8,
+            temperature=0.0,
+            timeout=20,
+        ).get("text", "").strip().upper()
+    except Exception as error:
+        print(f"fastai: anime detection failed, falling back to keywords: {error}")
+        return None
+    result = answer.startswith("YES")
+    with _ANIME_CACHE_LOCK:
+        _ANIME_CACHE[key] = result
+    return result

@@ -26,10 +26,14 @@ box's own address stays hidden.
 """
 
 import hashlib
+import hmac
 import html
+import ipaddress
 import json
 import os
 import re
+import secrets
+import socket
 import threading
 import time
 import urllib.error
@@ -47,8 +51,7 @@ WEB_DIR = os.path.join(HERE, "web")
 TTS_CACHE = os.path.join(WEB_DIR, "tts")
 PORT = int(os.environ.get("KOOKIE_WEB_PORT", "8080"))
 # The family door: this key plus a Discord account she knows.
-WEB_FAMILY_KEY = os.environ.get(
-    "KOOKIE_WEB_FAMILY_KEY", "kookieitsmeoneofyourfamily10293927")
+WEB_FAMILY_KEY = os.environ.get("KOOKIE_WEB_FAMILY_KEY", "")
 # A door through the router: cloudflared's quick tunnel gives
 # her website an address on the open internet, so a phone can
 # reach her from anywhere without a forwarded port. It needs
@@ -64,6 +67,24 @@ BIND = os.environ.get("KOOKIE_WEB_BIND", "")
 SHOW_PUBLIC_IP = os.environ.get("KOOKIE_WEB_SHOW_PUBLIC_IP", "")
 # Custom domain for GitHub Pages (e.g., kookieAI.com)
 CUSTOM_DOMAIN = os.environ.get("KOOKIE_WEB_CUSTOM_DOMAIN", "").strip()
+# The page may live on another address (GitHub Pages, say), so the
+# browser asks her server from there. Only the origins she knows
+# about are answered: a wildcard would let any page on the
+# internet read what a visitor says to her.
+CORS_ENV = os.environ.get("KOOKIE_WEB_CORS_ORIGINS", "")
+# A provider may live on this network - a local Ollama, say - and
+# then it is the one host the relay is allowed to reach inside.
+PROVIDER_ALLOW = {
+    host.strip().lower()
+    for host in os.environ.get("KOOKIE_WEB_PROVIDER_ALLOW", "").split(",")
+    if host.strip()
+}
+# How long she waits for a visitor's provider, and how much of
+# its answer she reads. Both are small on purpose: the relay is
+# not a place to spend minutes or disk.
+PROVIDER_TIMEOUT = float(
+    os.environ.get("KOOKIE_WEB_PROVIDER_TIMEOUT", "20"))
+MAX_PROVIDER_BYTES = 2 * 1024 * 1024
 
 os.makedirs(TTS_CACHE, exist_ok=True)
 
@@ -75,6 +96,7 @@ KEYS_FILE = os.path.join(WEB_DIR, "web_keys.json")
 # forever, so only the newest ones stay on disk.
 KEYS_KEPT = 500
 _keys = None
+_key_digests = None
 _keys_lock = threading.Lock()
 
 # One chat job at a time keeps her from answering two people at
@@ -92,9 +114,10 @@ API_DESCRIPTION = {
     "name": "Kookie",
     "get_a_key": "POST /api/issue-key, optionally "
                  'with {"name": "my project"}',
-    "send_the_key": "the X-Kookie-Key header, or "
-                    "?key= in the address for a "
-                    "voice stream",
+    "send_the_key": "the X-Kookie-Key header. A voice "
+                    "stream cannot send a header, so it takes "
+                    "a short-lived token from "
+                    "POST /api/tts-token instead",
     "endpoints": {
         "POST /api/ask": "one message in, one answer "
                          'out: {"message": "hi"} answers '
@@ -106,6 +129,8 @@ API_DESCRIPTION = {
                               "written, one event per "
                               "token",
         "POST /api/issue-key": "hand out one of her keys",
+        "GET /api/health": "whether she is awake, for a "
+                           "health check: no key needed",
         "POST /api/provider": "relay one chat turn to "
                                "a visitor's own AI "
                                "provider, using the key "
@@ -121,6 +146,8 @@ API_DESCRIPTION = {
                                 "account is one of "
                                 "her family",
         "GET /api/status": "her mood right now",
+        "GET /api/tts-token": "a short-lived token for the "
+                               "voice stream",
         "GET /api/tts?text=": "her voice for a sentence",
         "GET /api/whoami": "who the door thinks you are",
     },
@@ -152,11 +179,36 @@ def _lan_ips():
     return out
 
 
+def _key_digest(value):
+    """The hash of a key.
+
+    A browser keeps the hash of a key and never the key itself,
+    so this is what she is asked for as often as the key.
+    """
+    return hashlib.sha256(
+        str(value or "").encode("utf-8")).hexdigest()
+
+
+def _matches_key(candidate, key):
+    """Is this the key, or the hash a browser keeps of it?"""
+    if not candidate or not key:
+        return False
+    try:
+        if hmac.compare_digest(str(candidate), str(key)):
+            return True
+        # The browser sends the hash of the key, not the key.
+        return hmac.compare_digest(
+            str(candidate), _key_digest(key))
+    except (TypeError, ValueError):
+        return False
+
+
 def _read_keys():
     """The keys on disk, cached. The caller holds the lock."""
-    global _keys
+    global _keys, _key_digests
     if _keys is None:
         _keys = {}
+        _key_digests = set()
         try:
             with open(KEYS_FILE, "r", encoding="utf-8") as f:
                 loaded = json.load(f)
@@ -167,6 +219,7 @@ def _read_keys():
                     _keys[stored] = value if isinstance(
                         value, dict) else {
                             "issued": str(value), "name": ""}
+                    _key_digests.add(_key_digest(stored))
         except (OSError, ValueError):
             pass
     return _keys
@@ -178,15 +231,31 @@ def _load_keys():
         return _read_keys()
 
 
+def _load_key_digests():
+    """The hashes of the keys she has handed out."""
+    with _keys_lock:
+        _read_keys()
+        return set(_key_digests or ())
+
+
 def _is_issued(candidate):
-    """Is this one of the keys she handed out?"""
-    return bool(candidate) and candidate in _load_keys()
+    """Is this one of the keys she handed out?
+
+    Either the key itself, or the hash a browser keeps of it:
+    the page never holds a key in the clear.
+    """
+    if not candidate:
+        return False
+    candidate = str(candidate)
+    if candidate in _load_keys():
+        return True
+    # The browser sends the hash of a key, never the key itself.
+    return candidate in _load_key_digests()
 
 
 def _mint_key(name=""):
     """A key of her own, for one project of theirs."""
-    import secrets
-
+    global _key_digests
     fresh = secrets.token_hex(16)
     with _keys_lock:
         store = _read_keys()
@@ -195,12 +264,22 @@ def _mint_key(name=""):
                 "%Y-%m-%d %H:%M:%S", time.gmtime()),
             "name": str(name).strip()[:64],
         }
+        # A browser keeps the hash of a key, so the hash of this
+        # one has to be known as well.
+        if _key_digests is None:
+            _key_digests = set()
+        _key_digests.add(_key_digest(fresh))
         if len(store) > KEYS_KEPT:
             for stale in list(store)[: len(store) - KEYS_KEPT]:
                 del store[stale]
         try:
-            with open(KEYS_FILE, "w", encoding="utf-8") as f:
-                json.dump(store, f, indent=1)
+            fd = os.open(KEYS_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.write(fd, (json.dumps(store, indent=1) + "\n").encode("utf-8"))
+            finally:
+                os.close(fd)
+            # An older file keeps its old, wider mode.
+            os.chmod(KEYS_FILE, 0o600)
         except OSError:
             pass
     return fresh
@@ -294,6 +373,147 @@ def _remember_message(visitor, role, content):
         memory.remember(f"AI: {content}")
 
 
+MAX_BODY_BYTES = 1024 * 1024
+
+
+def _require_key(handler):
+    """Require a valid issued key or family key."""
+    kind = handler._key_kind()
+    if kind is None:
+        handler._unauthorized()
+        return False
+    return True
+
+
+def _json_body(handler, max_bytes=MAX_BODY_BYTES):
+    """The body of a request, as a dict, or None if it is not one.
+
+    A body that is not a JSON object, is larger than the cap, or
+    has a broken Content-Length is refused here, with an answer
+    of its own, instead of crashing a handler further down.
+    """
+    try:
+        length = int(handler.headers.get("Content-Length", 0) or 0)
+    except (TypeError, ValueError):
+        handler.close_connection = True
+        handler._send(400, "bad Content-Length", "text/plain")
+        return None
+    if length <= 0:
+        return {}
+    if length > max_bytes:
+        handler.close_connection = True
+        handler._send(413, "body too large", "text/plain")
+        return None
+    try:
+        raw = handler.rfile.read(length)
+    except OSError:
+        return None
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except (ValueError, json.JSONDecodeError):
+        handler._send(400, "bad json", "text/plain")
+        return None
+    if not isinstance(data, dict):
+        handler._send(400, "expected a json object", "text/plain")
+        return None
+    return data
+
+
+def _safe_max_tokens(value):
+    """How long an answer may be, whatever the caller asked for."""
+    try:
+        tokens = int(value)
+    except (TypeError, ValueError):
+        return 1024
+    return max(1, min(32768, tokens))
+
+
+def _read_capped(response, limit=MAX_PROVIDER_BYTES):
+    """A provider's answer, but never more than the limit."""
+    data = response.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError("the provider's answer was too large")
+    return data
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Redirects are not followed.
+
+    A public address that answers with a 302 to 127.0.0.1 would
+    walk straight past the check below, so the relay is given the
+    redirect itself instead of taking it.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+def _is_private_or_special_host(ip):
+    """Is this address one of hers, or one of the network's?"""
+    try:
+        address = ipaddress.ip_address(str(ip))
+    except ValueError:
+        return True
+    if (address.is_loopback or address.is_private
+            or address.is_link_local or address.is_reserved
+            or address.is_multicast or address.is_unspecified):
+        return True
+    if isinstance(address, ipaddress.IPv4Address):
+        if address in ipaddress.ip_network("100.64.0.0/10"):
+            return True
+    return False
+
+
+def _provider_url_ok(url):
+    """Is this a provider address the relay may speak to?
+
+    Only http and https, and never a host on this box or on the
+    private network: the relay must not become a way in for the
+    people who talk to the website. KOOKIE_WEB_PROVIDER_ALLOW
+    lists the hosts that are allowed anyway - a local Ollama,
+    for one.
+    """
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except ValueError:
+        return False, "that API address is not valid"
+    if parsed.scheme not in ("http", "https"):
+        return False, "only http and https addresses work"
+    if parsed.username or parsed.password:
+        return False, "that API address may not carry a login"
+    host = (parsed.hostname or "").strip().lower()
+    if not host:
+        return False, "that API address has no host"
+    if host in PROVIDER_ALLOW:
+        return True, ""
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError:
+        return False, f"she cannot find {host}"
+    for info in infos:
+        try:
+            ip = info[4][0]
+        except (IndexError, TypeError):
+            return False, f"she cannot work out where {host} is"
+        if _is_private_or_special_host(ip):
+            return False, ("that address is on this network, so she "
+                           "will not call it")
+    return True, ""
+
+
+def _unlink(path):
+    """Take a file away, if it is there."""
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
 def _synthesize(text, wav_path):
     """Her voice, as a wav on disk."""
     try:
@@ -317,6 +537,7 @@ class ChatJob:
         self.done = threading.Event()
         self.result = None
         self.error = None
+        self.created = time.time()
 
     def on_text(self, partial):
         with self.lock:
@@ -325,6 +546,57 @@ class ChatJob:
     def snapshot(self):
         with self.lock:
             return self.partial
+
+
+def _chat_kwargs(visitor, on_text):
+    """How she is told who is talking."""
+    if visitor:
+        return dict(
+            on_reply_text=on_text,
+            speaker_name=visitor["name"],
+            speaker_is_owner=visitor["is_owner"],
+            speaker_id=visitor["id"],
+            on_website=True,
+            tools_enabled=True,
+        )
+    return dict(
+        on_reply_text=on_text,
+        speaker_name="stranger",
+        speaker_is_owner=False,
+        speaker_id=None,
+        on_website=True,
+        # A stranger gets no tools: she may add up a sum for
+        # them, but she does not write files or touch the screen
+        # for anybody who found the website.
+        tools_enabled=False,
+    )
+
+
+def _safe_tool_round(result, message, visitor, on_text):
+    """One more turn, but only for a tool that is always safe.
+
+    She may add up a sum for a stranger; she may not edit a file
+    or click the mouse for one.
+    """
+    call = result.get("tool_call") if isinstance(result, dict) else None
+    if not isinstance(call, dict):
+        return result
+    name = str(call.get("tool") or "")
+    if not controller.tool_is_always_allowed(name):
+        return result
+    try:
+        outcome = controller.execute_tool_call(
+            name, call.get("arg_value") or call.get("argvalue") or "")
+    except Exception as error:
+        outcome = f"Error: {error}"
+    note = (f"Tool result from {name}: {str(outcome)[:2000]}\n\n"
+            "Use it in your answer.")
+    try:
+        return controller.ask_ai(
+            message, context_note=note,
+            **_chat_kwargs(visitor, on_text))
+    except Exception:
+        return result
 
 
 def start_chat(message, visitor=None):
@@ -338,42 +610,44 @@ def start_chat(message, visitor=None):
     job = ChatJob()
 
     def run():
-        try:
-            if visitor:
-                controller.note_discord_person(
-                    visitor["id"], visitor["name"],
-                    visitor["username"], text=message,
-                    said_by_user=True)
+        # One answer at a time, as before: the lock is taken by
+        # the worker, not by the request that started it, so a
+        # visitor waiting for an answer does not block the whole
+        # website while she thinks.
+        with CHAT_LOCK:
+            try:
+                if visitor:
+                    controller.note_discord_person(
+                        visitor["id"], visitor["name"],
+                        visitor["username"], text=message,
+                        said_by_user=True)
                 result = controller.ask_ai(
-                    message,
-                    on_reply_text=job.on_text,
-                    speaker_name=visitor["name"],
-                    speaker_is_owner=visitor["is_owner"],
-                    speaker_id=visitor["id"],
-                    on_website=True,
-                    tools_enabled=True,
-                )
-            else:
-                result = controller.ask_ai(
-                    message,
-                    on_reply_text=job.on_text,
-                    speaker_name="stranger",
-                    speaker_is_owner=False,
-                    speaker_id=None,
-                    on_website=True,
-                    tools_enabled=True,
-                )
-            if not isinstance(result, dict):
-                result = {"reply": str(result), "emotion": "neutral"}
-            job.result = result
-        except Exception as error:
-            job.error = str(error)
-        finally:
-            job.done.set()
+                    message, **_chat_kwargs(visitor, job.on_text))
+                if not isinstance(result, dict):
+                    result = {"reply": str(result), "emotion": "neutral"}
+                result = _safe_tool_round(
+                    result, message, visitor, job.on_text)
+                job.result = result
+            except Exception as error:
+                job.error = str(error)
+            finally:
+                job.done.set()
 
     thread = threading.Thread(target=run, daemon=True)
     thread.start()
     return job
+
+
+def _sweep_jobs():
+    """Chats nobody came back for do not stay in the book."""
+    now = time.time()
+    with JOBS_LOCK:
+        stale = [
+            job_id for job_id, job in JOBS.items()
+            if getattr(job, "created", 0) < now - JOB_TTL
+        ]
+        for job_id in stale:
+            JOBS.pop(job_id, None)
 
 
 def _pick_reply(data):
@@ -469,6 +743,8 @@ def _error_detail(raw, error):
         # Some providers (e.g., Gemini) return a list instead of dict
         if isinstance(payload, list) and payload:
             payload = payload[0]
+        if not isinstance(payload, dict):
+            return ""
         problem = payload.get("error")
         if isinstance(problem, dict):
             detail = str(problem.get("message") or "")
@@ -482,20 +758,23 @@ def _error_detail(raw, error):
         f"the provider returned status {error.code}")
 
 
-def _family_visitor(payload):
+def _family_visitor(handler):
     """The family member this call claims to be, or None.
 
-    The page sends the Discord id the developer door
-    confirmed, and her people file decides whether that
-    account is really family: the one she belongs to,
-    or somebody given a place in her family.
+    The family key says "I might be family"; the Discord
+    account says who, and only in a header - never in the body
+    of a request, which anybody can write. Her people file
+    decides whether that account is really family: the one she
+    belongs to, or somebody given a place in her family.
     """
-    if not isinstance(payload, dict):
+    if handler is None:
         return None
-    claim = payload.get("family")
-    if not isinstance(claim, dict):
+    try:
+        if handler._key_kind() != "family":
+            return None
+        ref = str(handler.headers.get("X-Kookie-Discord", "") or "").strip()
+    except Exception:
         return None
-    ref = str(claim.get("discord") or "").strip()
     if not re.fullmatch(r"\d{17,20}", ref):
         return None
     try:
@@ -508,7 +787,7 @@ def _family_visitor(payload):
     return None
 
 
-def _relay(payload):
+def _relay(payload, handler=None):
     """One chat turn, carried to the visitor's own AI provider.
 
     The page hands this server the address, key and model
@@ -518,17 +797,23 @@ def _relay(payload):
     """
     cfg = payload.get("cfg") if isinstance(payload, dict) else None
     cfg = cfg if isinstance(cfg, dict) else {}
-    messages = payload.get("messages") if isinstance(payload, dict) else None
-    if not isinstance(messages, list) or not messages:
+    raw_messages = (payload.get("messages")
+                    if isinstance(payload, dict) else None)
+    if not isinstance(raw_messages, list) or not raw_messages:
+        return None, "say something first"
+    # Only real messages go out: a list of strings is not a chat.
+    messages = [
+        message for message in raw_messages
+        if isinstance(message, dict)
+        and isinstance(message.get("content"), str)
+    ]
+    if not messages:
         return None, "say something first"
     # The worst words never reach a provider:
     # starred out before they leave her box.
     for message in messages:
-        if (isinstance(message, dict)
-                and isinstance(message.get("content"), str)):
-            message["content"] = _censor(
-                message["content"])
-    max_tokens = payload.get("max_tokens") or 1024
+        message["content"] = _censor(message["content"])
+    max_tokens = _safe_max_tokens(payload.get("max_tokens"))
     kind = str(cfg.get("kind") or "")
     base = str(cfg.get("url") or "").strip().rstrip("/")
     key = str(cfg.get("key") or "")
@@ -538,7 +823,7 @@ def _relay(payload):
     # confirmed them: her own words for who
     # this person is to her travel with the
     # call, the same as they do on Discord.
-    visitor = _family_visitor(payload)
+    visitor = _family_visitor(handler)
     if visitor:
         identity = controller.address_rules_for(
             name=str(visitor.get("name") or ""),
@@ -550,6 +835,9 @@ def _relay(payload):
     system = (CREATOR + " " + system).strip()
     if not base:
         return None, "enter the API address"
+    allowed, why = _provider_url_ok(base)
+    if not allowed:
+        return None, why
     if kind == "anthropic":
         url = base + "/v1/messages"
         headers = {
@@ -618,15 +906,15 @@ def _relay(payload):
                 data=json.dumps(body).encode("utf-8"),
                 headers=headers, method="POST")
             try:
-                with urllib.request.urlopen(
-                        request, timeout=30) as response:
-                    raw = response.read().decode(
+                with _OPENER.open(
+                        request, timeout=PROVIDER_TIMEOUT) as response:
+                    raw = _read_capped(response).decode(
                         "utf-8", "replace") or "{}"
                     return response.status, raw, None
             except urllib.error.HTTPError as error:
                 raw = ""
                 try:
-                    raw = error.read().decode(
+                    raw = error.read(MAX_PROVIDER_BYTES).decode(
                         "utf-8", "replace")
                 except Exception:
                     pass
@@ -661,20 +949,23 @@ def _relay(payload):
         url, data=json.dumps(body).encode("utf-8"),
         headers=headers, method="POST")
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with _OPENER.open(
+                request, timeout=PROVIDER_TIMEOUT) as response:
             data = json.loads(
-                response.read().decode("utf-8", "replace") or "{}")
+                _read_capped(response).decode(
+                    "utf-8", "replace") or "{}")
     except urllib.error.HTTPError as error:
         detail = ""
         try:
             raw = json.loads(
-                error.read().decode("utf-8", "replace") or "{}")
-            problem = raw.get("error")
+                error.read(MAX_PROVIDER_BYTES).decode(
+                    "utf-8", "replace") or "{}")
+            problem = raw.get("error") if isinstance(raw, dict) else None
             if isinstance(problem, dict):
                 detail = str(problem.get("message") or "")
             elif problem:
                 detail = str(problem)
-            if not detail:
+            if not detail and isinstance(raw, dict):
                 detail = str(raw.get("message") or "")
         except (ValueError, json.JSONDecodeError):
             pass
@@ -700,6 +991,9 @@ def _models(payload):
     key = str(cfg.get("key") or "")
     if not base:
         return None, "enter the API address"
+    allowed, why = _provider_url_ok(base)
+    if not allowed:
+        return None, why
     if kind == "anthropic":
         url = base + "/v1/models?limit=1000"
         headers = {
@@ -714,23 +1008,23 @@ def _models(payload):
     request = urllib.request.Request(
         url, headers=headers, method="GET")
     try:
-        with urllib.request.urlopen(
-                request, timeout=20) as response:
+        with _OPENER.open(
+                request, timeout=PROVIDER_TIMEOUT) as response:
             data = json.loads(
-                response.read().decode("utf-8", "replace")
-                or "{}")
+                _read_capped(response).decode(
+                    "utf-8", "replace") or "{}")
     except urllib.error.HTTPError as error:
         detail = ""
         try:
             raw = json.loads(
-                error.read().decode("utf-8", "replace")
-                or "{}")
-            problem = raw.get("error")
+                error.read(MAX_PROVIDER_BYTES).decode(
+                    "utf-8", "replace") or "{}")
+            problem = raw.get("error") if isinstance(raw, dict) else None
             if isinstance(problem, dict):
                 detail = str(problem.get("message") or "")
             elif problem:
                 detail = str(problem)
-            if not detail:
+            if not detail and isinstance(raw, dict):
                 detail = str(raw.get("message") or "")
         except (ValueError, json.JSONDecodeError):
             pass
@@ -743,14 +1037,98 @@ def _models(payload):
     return data, None
 
 
+_CORS_CACHE = None
+_CORS_LOCK = threading.Lock()
+
+# A short-lived token for one voice clip. The master key never
+# travels in an address bar: the voice stream cannot send a
+# header, so it gets a token that only speaks for her voice, and
+# only for a couple of minutes.
+TTS_TOKEN_TTL = 120
+_TTS_TOKENS = {}
+_TTS_TOKENS_LOCK = threading.Lock()
+
+# How long a chat may be waited for before the caller is told she
+# is taking too long. A slow model on a slow box is normal here.
+CHAT_WAIT_SECONDS = 300
+
+# Chats nobody came back for are swept away after this long.
+JOB_TTL = 900
+
+
+def _cors_allowed_origins():
+    """The origins the page is allowed to come from.
+
+    Never a wildcard: the page may live on another address
+    (GitHub Pages, say), but only the ones she knows about are
+    answered, so no page on the internet can read what a visitor
+    says to her.
+    """
+    global _CORS_CACHE
+    with _CORS_LOCK:
+        if _CORS_CACHE is None:
+            allowed = set()
+            for origin in CORS_ENV.split(","):
+                origin = origin.strip().rstrip("/")
+                if origin:
+                    allowed.add(origin)
+            if CUSTOM_DOMAIN:
+                domain = CUSTOM_DOMAIN.strip().rstrip("/")
+                for scheme in ("https://", "http://"):
+                    allowed.add(scheme + domain)
+            allowed.add(f"http://localhost:{PORT}")
+            allowed.add(f"http://127.0.0.1:{PORT}")
+            for ip in _lan_ips():
+                allowed.add(f"http://{ip}:{PORT}")
+            _CORS_CACHE = allowed
+        return _CORS_CACHE
+
+
+def _mint_tts_token():
+    """A token for one voice clip, good for a couple of minutes."""
+    token = secrets.token_urlsafe(16)
+    now = time.time()
+    with _TTS_TOKENS_LOCK:
+        for old, made in list(_TTS_TOKENS.items()):
+            if now - made > TTS_TOKEN_TTL:
+                del _TTS_TOKENS[old]
+        _TTS_TOKENS[token] = now
+    return token
+
+
+def _tts_token_ok(token):
+    """Is this a live voice token?"""
+    token = str(token or "")
+    if not token:
+        return False
+    now = time.time()
+    with _TTS_TOKENS_LOCK:
+        made = _TTS_TOKENS.get(token)
+        if made is None:
+            return False
+        if now - made > TTS_TOKEN_TTL:
+            _TTS_TOKENS.pop(token, None)
+            return False
+        return True
+
+
 class Handler(BaseHTTPRequestHandler):
     """Every route her phone needs, on one small server."""
 
     server_version = "KookieWeb/1.0"
     protocol_version = "HTTP/1.1"
 
-    def log_message(self, _fmt, *_args):
-        pass
+    def log_message(self, fmt, *args):
+        """The access log is noise on a phone; the failures are not."""
+        try:
+            status = str(args[1]) if len(args) > 1 else ""
+        except Exception:
+            status = ""
+        if status.startswith(("4", "5")):
+            try:
+                print(f"web: {fmt % args}")
+            except Exception:
+                pass
 
     def _send(self, code, body, ctype, extra=None):
         if isinstance(body, str):
@@ -758,8 +1136,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        # CORS headers
-        self.send_header("Access-Control-Allow-Origin", "*")
+        # CORS headers: only for the origins she knows, never a
+        # wildcard.
+        origin = self._cors_origin()
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Kookie-Key, X-Kookie-Discord")
         for key, value in (extra or {}).items():
@@ -770,10 +1152,14 @@ class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         """Handle CORS preflight requests."""
         self.send_response(200)
-        self.send_header("Access-Control-Allow-Origin", "*")
+        origin = self._cors_origin()
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Kookie-Key, X-Kookie-Discord")
         self.send_header("Access-Control-Max-Age", "86400")
+        self.send_header("Content-Length", "0")
         self.end_headers()
 
     def _file(self, path, ctype):
@@ -785,37 +1171,50 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._send(200, body, ctype)
 
+    def _cors_origin(self):
+        """The origin she answers with, if any."""
+        origin = (self.headers.get("Origin") or "").strip().rstrip("/")
+        if not origin:
+            return None
+        if _tunnel_url and origin == _tunnel_url.rstrip("/"):
+            return origin
+        if origin in _cors_allowed_origins():
+            return origin
+        return None
+
     def _supplied_key(self):
         """The key this request carries, if any.
 
-        A fetch sends it as a header; the voice stream
-        cannot, so it may arrive as a query instead.
+        Only in a header: a key in an address ends up in the
+        tunnel's logs, in the browser's history and in the
+        Referer of every page the browser visits next.
         """
-        supplied = self.headers.get("X-Kookie-Key", "")
-        if not supplied:
-            query = urllib.parse.parse_qs(
-                urllib.parse.urlparse(self.path).query
-            )
-            supplied = query.get("key", [""])[0]
-        return supplied
+        return self.headers.get("X-Kookie-Key", "")
+
+    def _tts_token(self):
+        """A voice token from the address, if there is one."""
+        query = urllib.parse.parse_qs(
+            urllib.parse.urlparse(self.path).query
+        )
+        return query.get("token", [""])[0]
 
     def _key_kind(self):
-        """Which door this key opens: family, stranger, or none.
-
-        Her family key is hers alone, and so is a
-        stranger key the owner set. Without one, her
-        website stands open and hands out keys of its
-        own: one of those opens the stranger door, and
-        anything else is not a key of hers.
-        """
+        """Which door this key opens: family, stranger, or none."""
         supplied = self._supplied_key()
-        if WEB_FAMILY_KEY and supplied == WEB_FAMILY_KEY:
+        if not supplied:
+            return None
+        if WEB_FAMILY_KEY and _matches_key(supplied, WEB_FAMILY_KEY):
             return "family"
-        if supplied and _is_issued(supplied):
+        if _is_issued(supplied):
             return "stranger"
         return None
 
     def _unauthorized(self):
+        try:
+            who = self.client_address[0]
+        except Exception:
+            who = "?"
+        print(f"web: refused a request with no valid key from {who}")
         self._send(401, "wrong key", "text/plain")
 
     def do_GET(self):
@@ -833,6 +1232,29 @@ class Handler(BaseHTTPRequestHandler):
             # can find out how to talk to her.
             self._send(
                 200, json.dumps(API_DESCRIPTION),
+                "application/json",
+            )
+            return
+        if path == "/api/health":
+            # The health check, public on purpose: it says that
+            # she is awake and nothing else.
+            self._send(
+                200, json.dumps({"ok": True}), "application/json")
+            return
+        if path == "/api/status":
+            # Her mood, and the deploy's health check: public,
+            # because a mood is no secret and a health check
+            # cannot hold a key.
+            mood = controller.get_mood_state()
+            self._send(
+                200,
+                json.dumps(
+                    {
+                        "mood": mood.get("mood", ""),
+                        "intensity": mood.get("intensity", 0.5),
+                        "voice": voice.VOICE_ENABLED,
+                    }
+                ),
                 "application/json",
             )
             return
@@ -866,12 +1288,41 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/memory":
             # A visitor's remembered messages, for the
-            # browser that holds their id.
+            # browser that holds their id. Behind a key,
+            # like everything else that holds what was said.
+            if not _require_key(self):
+                return
             self._memory(query)
             return
         if path == "/api/webmemory":
-            # All web chat memory, for viewing from the frontend.
+            # All web chat memory, for viewing from the
+            # frontend: still a key, because it is everybody's
+            # conversations at once.
+            if not _require_key(self):
+                return
             self._webmemory()
+            return
+        if path == "/api/tts-token":
+            # A short-lived token for the voice stream, so the
+            # master key never has to travel in an address.
+            if not _require_key(self):
+                return
+            self._send(
+                200,
+                json.dumps({
+                    "token": _mint_tts_token(),
+                    "expires_in": TTS_TOKEN_TTL,
+                }),
+                "application/json",
+            )
+            return
+        if path == "/api/tts":
+            # A key in a header, or a voice token in the address.
+            if (not self._key_kind()
+                    and not _tts_token_ok(self._tts_token())):
+                self._unauthorized()
+                return
+            self._tts(query.get("text", [""])[0])
             return
         kind = self._key_kind()
         if kind is None:
@@ -880,40 +1331,33 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/api/chat/"):
             self._stream_chat(path[len("/api/chat/"):])
             return
-        if path == "/api/tts":
-            self._tts(query.get("text", [""])[0])
-            return
-        if path == "/api/status":
-            mood = controller.get_mood_state()
-            self._send(
-                200,
-                json.dumps(
-                    {
-                        "mood": mood.get("mood", ""),
-                        "intensity": mood.get("intensity", 0.5),
-                        "voice": voice.VOICE_ENABLED,
-                    }
-                ),
-                "application/json",
-            )
-            return
         self._send(404, "not found", "text/plain")
 
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/api/issue-key":
+            # The one door that stands open: a key is a key
+            # anybody may ask for.
             self._issue_key()
             return
         if parsed.path == "/api/provider":
+            if not _require_key(self):
+                return
             self._provider()
             return
         if parsed.path == "/api/remember":
+            if not _require_key(self):
+                return
             self._remember()
             return
         if parsed.path == "/api/models":
+            if not _require_key(self):
+                return
             self._models()
             return
         if parsed.path == "/api/dev-id":
+            if not _require_key(self):
+                return
             self._dev_id()
             return
         if parsed.path == "/api/ask":
@@ -930,12 +1374,10 @@ class Handler(BaseHTTPRequestHandler):
         if kind is None:
             self._unauthorized()
             return
-        length = int(self.headers.get("Content-Length", 0) or 0)
-        try:
-            data = json.loads(self.rfile.read(length) or b"{}")
-            message = str(data.get("message", "")).strip()
-        except (ValueError, json.JSONDecodeError):
-            message = ""
+        payload = _json_body(self)
+        if payload is None:
+            return
+        message = str(payload.get("message", "") or "").strip()
         if not message:
             self._send(400, "say something first", "text/plain")
             return
@@ -946,13 +1388,14 @@ class Handler(BaseHTTPRequestHandler):
         if kind == "family":
             visitor = controller.website_visitor(
                 self.headers.get("X-Kookie-Discord", ""))
-        with CHAT_LOCK:
-            job = start_chat(message, visitor)
-            job_id = hashlib.md5(
-                f"{time.time():.6f}".encode()
-            ).hexdigest()[:12]
-            with JOBS_LOCK:
-                JOBS[job_id] = job
+        # The chat lock is taken by the worker, not by this
+        # request, so a visitor waiting for an answer does not
+        # hold up everybody else's turn to ask.
+        job = start_chat(message, visitor)
+        job_id = secrets.token_urlsafe(16)
+        _sweep_jobs()
+        with JOBS_LOCK:
+            JOBS[job_id] = job
         self._send(202, json.dumps({"id": job_id}), "application/json")
 
     def _issue_key(self):
@@ -964,13 +1407,10 @@ class Handler(BaseHTTPRequestHandler):
         way. The name is theirs to pick, so the keys
         out in the world say whose project is whose.
         """
-        name = ""
-        length = int(self.headers.get("Content-Length", 0) or 0)
-        try:
-            data = json.loads(self.rfile.read(length) or b"{}")
-            name = str(data.get("name", ""))
-        except (ValueError, json.JSONDecodeError):
-            pass
+        payload = _json_body(self)
+        if payload is None:
+            return
+        name = str(payload.get("name", "") or "")
         self._send(
             200, json.dumps({"key": _mint_key(name)}),
             "application/json",
@@ -984,15 +1424,13 @@ class Handler(BaseHTTPRequestHandler):
         speaks to the address the visitor themselves typed
         in, with the key they themselves pasted.
         """
-        length = int(self.headers.get("Content-Length", 0) or 0)
-        try:
-            payload = json.loads(self.rfile.read(length) or b"{}")
-        except (ValueError, json.JSONDecodeError):
-            payload = {}
+        payload = _json_body(self)
+        if payload is None:
+            return
         if not isinstance(payload.get("messages"), list):
             self._send(400, "say something first", "text/plain")
             return
-        reply, error = _relay(payload)
+        reply, error = _relay(payload, self)
         if error is not None:
             self._send(
                 502, json.dumps({"error": error}),
@@ -1040,12 +1478,9 @@ class Handler(BaseHTTPRequestHandler):
         The page sends each message as it happens,
         so a crash costs one message at most.
         """
-        length = int(self.headers.get("Content-Length", 0) or 0)
-        try:
-            payload = json.loads(
-                self.rfile.read(length) or b"{}")
-        except (ValueError, json.JSONDecodeError):
-            payload = {}
+        payload = _json_body(self)
+        if payload is None:
+            return
         visitor = str(payload.get("visitor") or "")
         if not _is_visitor(visitor):
             self._send(400, "no such visitor", "text/plain")
@@ -1084,12 +1519,9 @@ class Handler(BaseHTTPRequestHandler):
     def _models(self):
         """The models a visitor's provider offers,
         for the picker in the connection form."""
-        length = int(self.headers.get("Content-Length", 0) or 0)
-        try:
-            payload = json.loads(
-                self.rfile.read(length) or b"{}")
-        except (ValueError, json.JSONDecodeError):
-            payload = {}
+        payload = _json_body(self)
+        if payload is None:
+            return
         data, error = _models(payload)
         if error is not None:
             self._send(
@@ -1111,12 +1543,9 @@ class Handler(BaseHTTPRequestHandler):
         hers, not the page's, so it grows when
         her family does.
         """
-        length = int(self.headers.get("Content-Length", 0) or 0)
-        try:
-            payload = json.loads(
-                self.rfile.read(length) or b"{}")
-        except (ValueError, json.JSONDecodeError):
-            payload = {}
+        payload = _json_body(self)
+        if payload is None:
+            return
         ref = str(payload.get("discord") or "").strip()
         if not re.fullmatch(r"\d{17,20}", ref):
             self._send(
@@ -1150,12 +1579,10 @@ class Handler(BaseHTTPRequestHandler):
         stream, so a project does not have to read
         her reply one token at a time.
         """
-        length = int(self.headers.get("Content-Length", 0) or 0)
-        try:
-            data = json.loads(self.rfile.read(length) or b"{}")
-            message = str(data.get("message", "")).strip()
-        except (ValueError, json.JSONDecodeError):
-            message = ""
+        payload = _json_body(self)
+        if payload is None:
+            return
+        message = str(payload.get("message", "") or "").strip()
         if not message:
             self._send(400, "say something first", "text/plain")
             return
@@ -1163,9 +1590,14 @@ class Handler(BaseHTTPRequestHandler):
         if kind == "family":
             visitor = controller.website_visitor(
                 self.headers.get("X-Kookie-Discord", ""))
-        with CHAT_LOCK:
-            job = start_chat(message, visitor)
-            job.done.wait()
+        # The chat lock is taken by the worker, not by this
+        # request: waiting for her answer does not hold up
+        # everybody else's turn to ask. There is a limit to the
+        # waiting, all the same.
+        job = start_chat(message, visitor)
+        if not job.done.wait(CHAT_WAIT_SECONDS):
+            self._send(504, "she is taking too long", "text/plain")
+            return
         if job.error is not None:
             self._send(500, job.error, "text/plain")
             return
@@ -1195,21 +1627,30 @@ class Handler(BaseHTTPRequestHandler):
             )
             self.wfile.flush()
 
-        while not job.done.is_set():
-            time.sleep(0.25)
+        try:
+            while not job.done.is_set():
+                time.sleep(0.25)
+                partial = job.snapshot()
+                if len(partial) > sent:
+                    sent = len(partial)
+                    out("token", {"text": partial})
             partial = job.snapshot()
             if len(partial) > sent:
-                sent = len(partial)
                 out("token", {"text": partial})
-        partial = job.snapshot()
-        if len(partial) > sent:
-            out("token", {"text": partial})
-        if job.error is not None:
-            out("error", {"error": job.error})
-        else:
-            out("done", job.result or {"reply": partial})
-        with JOBS_LOCK:
-            JOBS.pop(job_id, None)
+            if job.error is not None:
+                out("error", {"error": job.error})
+            else:
+                out("done", job.result or {"reply": partial})
+        except (BrokenPipeError, ConnectionResetError):
+            # The visitor went away mid-sentence. The chat is
+            # still hers; they can come back for it.
+            pass
+        finally:
+            # Whether they listened to the end or not, the chat
+            # does not stay in the book for ever.
+            with JOBS_LOCK:
+                JOBS.pop(job_id, None)
+            _sweep_jobs()
 
     def _tts(self, text):
         """Her voice for a sentence, kept so the phone
@@ -1223,7 +1664,19 @@ class Handler(BaseHTTPRequestHandler):
         key = hashlib.md5(text.encode("utf-8")).hexdigest()[:16]
         wav_path = os.path.join(TTS_CACHE, f"{key}.wav")
         if not os.path.exists(wav_path):
-            if not _synthesize(text, wav_path):
+            # The voice is written to a side file and moved into
+            # place only when it is whole: a voice that failed
+            # halfway never leaves a broken wav behind for the
+            # next visitor to be handed.
+            tmp_path = f"{wav_path}.{os.getpid()}.tmp"
+            if not _synthesize(text, tmp_path):
+                _unlink(tmp_path)
+                self._send(500, "voice not available", "text/plain")
+                return
+            try:
+                os.replace(tmp_path, wav_path)
+            except OSError:
+                _unlink(tmp_path)
                 self._send(500, "voice not available", "text/plain")
                 return
         self._file(wav_path, "audio/wav")
@@ -1241,18 +1694,22 @@ def web_addresses():
     """The addresses her website answers on."""
     addresses = []
     tunneled = bool(TUNNEL and _tunnel_url)
-    # If custom domain is set, use it as the primary address
+    lan = []
+    if not (tunneled and not BIND):
+        ips = _lan_ips()
+        lan = (
+            [f"http://{ip}:{PORT}" for ip in ips]
+            or [f"http://localhost:{PORT}"]
+        )
+    # A custom domain is the address she is really at, so it
+    # comes first - and the addresses on this network are added
+    # to it, not put in its place.
     if CUSTOM_DOMAIN:
         domain = CUSTOM_DOMAIN
         if not domain.startswith(("http://", "https://")):
             domain = "https://" + domain
         addresses = [domain]
-    if not (tunneled and not BIND):
-        ips = _lan_ips()
-        addresses = (
-            [f"http://{ip}:{PORT}" for ip in ips]
-            or [f"http://localhost:{PORT}"]
-        )
+    addresses = addresses + lan
     if tunneled:
         addresses.append(_tunnel_url)
     return addresses
@@ -1303,13 +1760,16 @@ def _start_tunnel():
 
     def _watch():
         global _tunnel_url
+        # The pipe is read to the end, not just until the
+        # address shows up: a cloudflared that cannot write its
+        # log soon stops serving, and the address is worth far
+        # less than the tunnel.
         for line in iter(_tunnel_process.stdout.readline, b""):
             found = re.search(
                 r"https://[a-z0-9-]+\.trycloudflare\.com",
                 line.decode("utf-8", "replace"))
-            if found:
+            if found and not _tunnel_url:
                 _tunnel_url = found.group(0)
-                break
 
     threading.Thread(
         target=_watch, daemon=True, name="kookie-tunnel").start()
