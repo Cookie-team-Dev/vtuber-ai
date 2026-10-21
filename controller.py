@@ -1,6 +1,7 @@
 import atexit
 import collections
 import importlib
+import io
 import itertools
 import json
 import math
@@ -1210,13 +1211,25 @@ TOOL_PROMPT = (
     "Tools: read_code_file(filename), read_code_lines(filename,start,count), "
     "list_code_files(), search_code(query), replace_in_file(filename|old_text|new_text), "
     "append_to_file(filename|content), edit_code_file(filename|content), "
+    "run_python(code), "
     "observe_screen(), read_diary(), recall_memory(query), "
     "calculate(maths), click_at(x,y), "
     "type_text(text), press_key(key), take_screenshot(), sing(song_name), "
     "hum(song_name), sing_spotify(url), hum_spotify(url), how_to_sing(), "
-    "watch_video(url or file path), listen_video(url or file path), remember_face(name|photo path), browse(topic), think(topic), analyze(topic), "
+    "watch_video(url or file path), listen_video(url or file path), remember_face(name|photo path), browse(topic), http_request(url), weather(city), news(topic), stock_price(symbol), think(topic), analyze(topic), "
     "generate_image(prompt), draw(prompt), "
-    "system_status(), code_status()."
+    "set_reminder(text|minutes), list_reminders(), convert_units(value|from|to), "
+    "calculate_distance(lat1|lon1|lat2|lon2), time_between(iso1|iso2), "
+    "get_system_info(), set_volume(level), set_brightness(level), "
+    "system_status(), code_status(), "
+    "summarize(text), summarize(text|sentence count), translate(text|language), "
+    "sentiment(text), word_count(text), extract_links(text), qr_code(text), "
+    "shorten_url(url), "
+    "image_info(url or path), resize_image(url or path|width|height), "
+    "crop_image(url or path|x1|y1|x2|y2), convert_image(url or path|format), "
+    "encode_base64(text), decode_base64(text), hash_text(text|algorithm), "
+    "uuid(), timestamp(), "
+    "run_command(cmd), list_files(path|pattern), read_file(path|start|num), delete_file(path), copy_file(src|dst)."
 )
 
 GEN_Z_GUIDE_RULES = (
@@ -7201,6 +7214,1671 @@ def generate_image(prompt):
         return f"Image generation failed: {error}"
 
 
+_PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+_SAFE_COMMANDS = {"ls", "wc", "grep", "find", "pwd", "date", "df", "free", "uptime", "ps", "whoami", "uname", "echo", "mkdir", "touch", "rm", "cp", "mv"}
+_SENSITIVE_FILES = {"memory.json", "mood.json", "persona.json", ".env"}
+
+
+def _safe_path(path):
+    p = os.path.abspath(os.path.expanduser(path or ""))
+    if not (p == _PROJECT_ROOT or p.startswith(_PROJECT_ROOT + os.sep) or p.startswith("/tmp/")):
+        return None
+    return p
+
+
+def run_command(arg):
+    parts = str(arg or "").split()
+    if not parts:
+        return "Error: empty command"
+    cmd = parts[0]
+    if cmd not in _SAFE_COMMANDS:
+        return f"Error: command not allowed: {cmd}"
+    for tok in parts[1:]:
+        base = os.path.basename(tok)
+        if base in _SENSITIVE_FILES or base.endswith(".env") or "token" in base.lower() or "key" in base.lower():
+            return "Error: sensitive file"
+    if cmd in ("rm", "cp", "mv"):
+        for tok in parts[1:]:
+            if tok.startswith("-"):
+                continue
+            if not tok.startswith("/tmp"):
+                return "Error: rm/cp/mv only allowed in /tmp"
+    if cmd in ("grep", "find"):
+        for tok in parts[1:]:
+            if tok.startswith("-"):
+                continue
+            if "/" in tok or tok.startswith("~"):
+                if _safe_path(tok) is None:
+                    return "Error: path outside project directory"
+    try:
+        r = subprocess.run(parts, capture_output=True, text=True, timeout=30, shell=False)
+    except subprocess.TimeoutExpired:
+        return "Error: command timed out"
+    out = (r.stdout or "") + (r.stderr or "")
+    if len(out) > 4000:
+        out = out[:4000] + "\n...[truncated]"
+    return out if out else "(no output)"
+
+
+def list_files(arg):
+    arg = str(arg or "").strip()
+    path = _PROJECT_ROOT
+    pattern = None
+    if arg:
+        if "|" in arg:
+            path, pattern = [x.strip() for x in arg.split("|", 1)]
+        else:
+            path = arg
+    sp = _safe_path(path)
+    if sp is None:
+        return "Error: path outside project directory"
+    if not os.path.isdir(sp):
+        return "Error: not a directory"
+    import glob as _glob, datetime
+    entries = []
+    for name in sorted(os.listdir(sp)):
+        full = os.path.join(sp, name)
+        if pattern and not _glob.fnmatch.fnmatch(name, pattern):
+            continue
+        try:
+            st = os.stat(full)
+            mtime = datetime.datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M")
+            kind = "dir" if os.path.isdir(full) else "file"
+            entries.append(f"{name}  {kind}  {st.st_size} bytes  {mtime}")
+        except Exception as e:
+            entries.append(f"{name}  error: {e}")
+    return "\n".join(entries) if entries else "(empty)"
+
+
+def read_file(arg):
+    parts = [x.strip() for x in str(arg or "").split("|")]
+    path = parts[0] if parts else ""
+    start = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 1
+    num = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 2000
+    sp = _safe_path(path)
+    if sp is None:
+        return "Error: path outside project directory"
+    base = os.path.basename(sp)
+    if base in _SENSITIVE_FILES or base.endswith(".env") or "token" in base.lower():
+        return "Error: sensitive file"
+    if not os.path.isfile(sp):
+        return "Error: file not found"
+    num = min(num, 2000)
+    try:
+        with open(sp, "r", errors="replace") as f:
+            lines = f.readlines()
+    except Exception as e:
+        return f"Error: {e}"
+    chunk = lines[start - 1:start - 1 + num]
+    return "".join(f"{start + i}: {l}" for i, l in enumerate(chunk))
+
+
+def delete_file(arg):
+    path = str(arg or "").strip()
+    sp = _safe_path(path)
+    if sp is None:
+        return "Error: path outside allowed area"
+    data_dir = os.path.join(_PROJECT_ROOT, "data")
+    allowed = sp.startswith("/tmp/") or sp.startswith(data_dir + os.sep)
+    if not allowed:
+        return "Error: deletion only allowed in /tmp or data/"
+    base = os.path.basename(sp)
+    if base.endswith(".py") or base.endswith((".json", ".yaml", ".yml", ".toml", ".cfg", ".ini", ".env")):
+        return "Error: cannot delete config/code files"
+    if sp == _PROJECT_ROOT:
+        return "Error: cannot delete project root"
+    if not os.path.exists(sp):
+        return "Error: path does not exist"
+    try:
+        if os.path.isdir(sp) and not os.path.islink(sp):
+            import shutil
+            shutil.rmtree(sp)
+        else:
+            os.remove(sp)
+        return f"Deleted {sp}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def copy_file(arg):
+    raw = str(arg or "").strip()
+    parts = [x.strip() for x in raw.split("|")]
+    if len(parts) < 2:
+        parts = [x.strip() for x in raw.split(",")]
+    if len(parts) < 2:
+        return "Error: copy_file requires 'src|dst' or 'src,dst'"
+    src = _safe_path(parts[0])
+    dst = _safe_path(parts[1])
+    if src is None or dst is None:
+        return "Error: paths outside allowed area"
+    if not os.path.isfile(src):
+        return "Error: source not found"
+    try:
+        import shutil
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(src, dst)
+        return f"Copied {src} -> {dst}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# --- run_python: a small sandbox for the scripts she writes --------------
+# She works a lot of things out in little scripts: sort these numbers,
+# format this string, loop until the sum is big enough. run_python is where
+# they run. The namespace holds approved builtins and a few pure libraries,
+# the output is captured and capped, and a ten second clock stops a runaway
+# loop. It is a guard rail, not a jail: a confused script must not read a
+# file, start a process, open a socket or hang the bot.
+SANDBOX_TIMEOUT = 10
+SANDBOX_MAX_OUTPUT = 4000
+SANDBOX_BLOCKED_NAMES = frozenset({
+    "__import__", "open", "os", "sys", "subprocess", "eval", "exec", "compile",
+    "globals", "locals", "getattr", "setattr", "delattr", "input", "breakpoint",
+    "exit", "quit", "help", "socket", "shutil", "pathlib", "pickle",
+    "importlib", "ctypes", "threading", "multiprocessing", "asyncio",
+})
+# The ways of walking sideways out of a class: the mro, the subclasses, the
+# frames and the globals a function keeps.
+SANDBOX_BLOCKED_ATTRS = frozenset({
+    "mro", "subclasses", "f_globals", "f_locals", "f_back", "gi_frame",
+    "gi_code", "cr_frame", "cr_code", "func_globals",
+})
+SANDBOX_BUILTIN_NAMES = (
+    "print", "range", "len", "str", "int", "float", "list", "dict", "set",
+    "tuple", "bool", "type", "isinstance", "sorted", "reversed", "enumerate",
+    "zip", "map", "filter", "sum", "min", "max", "abs", "round", "any", "all",
+    "repr", "hash", "id", "iter", "next", "callable", "dir", "vars",
+    "Exception", "ValueError", "TypeError", "StopIteration",
+    "ArithmeticError", "IndexError", "KeyError", "AttributeError",
+)
+# The calls that are cut out of a script before it runs. The dangerous name
+# is replaced by str(), so the call keeps its brackets, turns into a harmless
+# string and the rest of the script still runs.
+SANDBOX_STRIP_PATTERNS = (
+    (r"\bimport\s+os\b", ""),
+    (r"\bimport\s+sys\b", ""),
+    (r"\bimport\s+subprocess\b", ""),
+    (r"\b__import__\b", "str"),
+    (r"\bopen\s*\(", "str("),
+    (r"\beval\s*\(", "str("),
+    (r"\bexec\s*\(", "str("),
+)
+
+
+class _SandboxTimeout(BaseException):
+    """Raised inside a script that ran out of time."""
+
+
+class _SandboxStdout(io.StringIO):
+    """A StringIO that stops at the cap instead of growing forever."""
+
+    def __init__(self, limit=SANDBOX_MAX_OUTPUT):
+        super().__init__()
+        self.limit = limit
+        self.size = 0
+        self.truncated = False
+
+    def write(self, text):
+        if self.size >= self.limit:
+            self.truncated = True
+            return len(text)
+        room = self.limit - self.size
+        if len(text) > room:
+            super().write(text[:room])
+            self.size = self.limit
+            self.truncated = True
+        else:
+            super().write(text)
+            self.size += len(text)
+        return len(text)
+
+
+def _sandbox_module_copy(module, names=None):
+    """A flat copy of the public names of a module.
+
+    Copying instead of handing over the module itself keeps the module's
+    private corners - its __dict__, the modules it imported, its loader -
+    out of reach, and the copies live in a plain namespace.
+    """
+    import types
+
+    if names is None:
+        names = [name for name in dir(module) if not name.startswith("_")]
+    space = types.SimpleNamespace()
+    for name in names:
+        value = getattr(module, name, None)
+        if value is None or isinstance(value, types.ModuleType):
+            continue
+        setattr(space, name, value)
+    return space
+
+
+def _sandbox_vars(*args):
+    """vars() without the private names.
+
+    The real vars() hands back a __dict__ full of __globals__ and
+    __subclasses__, which is a way out of the sandbox, so the private names
+    are dropped and the rest is copied.
+    """
+    if len(args) > 1:
+        raise TypeError("vars() takes at most one argument")
+    if args:
+        data = getattr(args[0], "__dict__", None)
+        if data is None:
+            raise TypeError("vars() argument must have a __dict__")
+    else:
+        data = sys._getframe(1).f_locals
+    try:
+        items = dict(data)
+    except (TypeError, ValueError):
+        raise TypeError("vars() argument must have a __dict__")
+    return {name: value for name, value in items.items() if not name.startswith("_")}
+
+
+def _sandbox_namespace():
+    """The names a sandboxed script can see."""
+    import builtins
+    import collections
+    import copy
+    import datetime
+    import decimal
+    import fractions
+    import itertools
+    import json
+    import math
+    import random
+    import re as re_module
+    import statistics
+    import string
+    import types
+
+    safe = {}
+    for name in SANDBOX_BUILTIN_NAMES:
+        value = getattr(builtins, name, None)
+        if value is None:
+            continue
+        safe[name] = _sandbox_vars if name == "vars" else value
+    # The machinery behind a class statement. The name itself is blocked, so
+    # a script can write a class but cannot call this by hand.
+    safe["__build_class__"] = builtins.__build_class__
+
+    return {
+        "__name__": "sandbox",
+        "__builtins__": safe,
+        "math": _sandbox_module_copy(math),
+        "constants": types.SimpleNamespace(
+            e=math.e, pi=math.pi, tau=math.tau, inf=math.inf, nan=math.nan
+        ),
+        "json": _sandbox_module_copy(json, ["dumps", "loads"]),
+        "datetime": _sandbox_module_copy(datetime, ["datetime", "timedelta"]),
+        "random": _sandbox_module_copy(random),
+        "string": _sandbox_module_copy(string),
+        "collections": _sandbox_module_copy(
+            collections, ["OrderedDict", "defaultdict", "Counter", "deque"]
+        ),
+        "itertools": _sandbox_module_copy(itertools),
+        "re": _sandbox_module_copy(re_module),
+        "decimal": _sandbox_module_copy(decimal, ["Decimal"]),
+        "fractions": _sandbox_module_copy(fractions, ["Fraction"]),
+        "statistics": _sandbox_module_copy(statistics, ["mean", "median", "stdev"]),
+        "copy": _sandbox_module_copy(copy, ["copy", "deepcopy"]),
+    }
+
+
+def _sandbox_strip(code):
+    """Take the dangerous calls out of a script."""
+    for pattern, replacement in SANDBOX_STRIP_PATTERNS:
+        code = re.sub(pattern, replacement, code)
+    return code
+
+
+def _sandbox_check(code):
+    """Reject what the sandbox cannot allow. Returns the error line, or None."""
+    import ast
+
+    try:
+        tree = ast.parse(code, filename="<sandbox>")
+    except SyntaxError as error:
+        detail = (error.msg or "").strip()
+        if not detail or detail == "invalid syntax":
+            return "Error: invalid syntax"
+        return "Error: invalid syntax: %s" % detail
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            return "Error: imports are not allowed in the sandbox"
+        if isinstance(node, ast.Attribute):
+            if node.attr.startswith("_"):
+                return "Error: attribute '%s' is not allowed in the sandbox" % node.attr
+            if node.attr in SANDBOX_BLOCKED_ATTRS:
+                return "Error: attribute '%s' is not allowed in the sandbox" % node.attr
+        if isinstance(node, ast.Name):
+            if node.id in SANDBOX_BLOCKED_NAMES:
+                return "Error: '%s' is not allowed in the sandbox" % node.id
+            if node.id.startswith("__"):
+                return "Error: names starting with '__' are not allowed in the sandbox"
+    return None
+
+
+def _sandbox_run(code, namespace, timeout):
+    """Run the script in a worker thread under a wall clock cap."""
+    deadline = time.monotonic() + timeout
+    state = {}
+    counter = {"lines": 0}
+
+    def _trace(frame, event, arg):
+        if event == "line":
+            counter["lines"] += 1
+            if counter["lines"] % 100 == 0 and time.monotonic() > deadline:
+                raise _SandboxTimeout(
+                    "the script ran for more than %d seconds" % timeout
+                )
+        return _trace
+
+    def _worker():
+        sys.settrace(_trace)
+        try:
+            exec(compile(code, "<sandbox>", "exec"), namespace)
+        except BaseException as error:
+            state["error"] = error
+        finally:
+            sys.settrace(None)
+
+    worker = threading.Thread(
+        target=_worker, name="kookie-python-sandbox", daemon=True
+    )
+    worker.start()
+    worker.join(timeout + 1)
+    if worker.is_alive():
+        raise _SandboxTimeout("the script ran for more than %d seconds" % timeout)
+    if "error" in state:
+        raise state["error"]
+
+
+def _sandbox_error(error):
+    """One clean line: no traceback, and no path from this machine in it."""
+    name = type(error).__name__
+    if isinstance(error, SyntaxError):
+        detail = (error.msg or "").strip()
+    else:
+        detail = str(error).strip()
+    detail = detail.replace(_PROJECT_ROOT, "<project>")
+    detail = re.sub(r"'/[^']*'", "'<path>'", detail)
+    detail = re.sub(r'"/[^"]*"', '"<path>"', detail)
+    if detail:
+        return "Error: %s: %s" % (name, detail)
+    return "Error: %s" % name
+
+
+def run_python(arg):
+    """Run a Python script in the sandbox and return what it printed."""
+    from contextlib import redirect_stdout
+
+    code = str(arg or "")
+    if not code.strip():
+        return "Error: run_python needs some code to run"
+    code = _sandbox_strip(code)
+    problem = _sandbox_check(code)
+    if problem:
+        return problem
+    namespace = _sandbox_namespace()
+    buffer = _SandboxStdout(SANDBOX_MAX_OUTPUT)
+    try:
+        with redirect_stdout(buffer):
+            _sandbox_run(code, namespace, SANDBOX_TIMEOUT)
+    except _SandboxTimeout as error:
+        return "Error: %s" % error
+    except BaseException as error:
+        return _sandbox_error(error)
+    output = buffer.getvalue()
+    if buffer.truncated:
+        output += "\n...[truncated]"
+    return output if output else "(no output)"
+
+
+# The tools that reach the internet. None of them needs an account or a key,
+# so they work the moment she is asked: one raw request, and three free
+# services that answer a question outright.
+HTTP_REQUEST_MAX_CHARS = 20000
+HTTP_REQUEST_TIMEOUT = 20
+HTTP_USER_AGENT = "KookieVTuber/1.0 (local vtuber companion)"
+WTTR_URL = "https://wttr.in/{city}?format=j1"
+OPEN_METEO_GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
+OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+HN_TOP_STORIES_URL = "https://hacker-news.firebaseio.com/v0/topstories.json"
+HN_ITEM_URL = "https://hacker-news.firebaseio.com/v0/item/{id}.json"
+HN_SEARCH_URL = "https://hn.algolia.com/api/v1/search"
+YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+
+
+def _http_host_is_public(host):
+    """True when the name points only at addresses that are not on this network.
+
+    A fetch tool that can be aimed at 127.0.0.1 or at the cloud metadata
+    address is a way into the machine she lives on, so a private, loopback,
+    link-local or reserved answer is refused before anything is sent.
+    """
+    import ipaddress
+    import socket
+
+    try:
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except (OSError, UnicodeError):
+        return False
+    if not infos:
+        return False
+    for info in infos:
+        try:
+            address = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            return False
+        if (
+            address.is_private
+            or address.is_loopback
+            or address.is_link_local
+            or address.is_reserved
+            or address.is_multicast
+            or address.is_unspecified
+        ):
+            return False
+    return True
+
+
+def http_request(arg):
+    """Fetch an address and hand back what it says.
+
+    The plain request she asked for, so a page, a file or an API answer can be
+    read without a browser. The body is cut off at a fixed length, because the
+    result goes straight into her prompt and a whole download would push the
+    rest of the turn out of the context window.
+    """
+    url = str(arg or "").strip()
+    if not url:
+        return "Error: http_request requires a URL"
+    if "://" not in url:
+        url = "https://" + url
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return (
+            f"Error: only http and https addresses can be fetched, "
+            f"not {parsed.scheme or 'that one'}"
+        )
+    host = parsed.hostname or ""
+    if not host:
+        return "Error: that address has no host in it"
+    if not _http_host_is_public(host):
+        return "Error: local and private network addresses are not fetched"
+    try:
+        with _HTTP_SESSION.get(
+            url,
+            timeout=HTTP_REQUEST_TIMEOUT,
+            stream=True,
+            headers={"User-Agent": HTTP_USER_AGENT},
+        ) as response:
+            body = bytearray()
+            for chunk in response.iter_content(8192):
+                body.extend(chunk)
+                if len(body) >= HTTP_REQUEST_MAX_CHARS:
+                    break
+            status = response.status_code
+            content_type = response.headers.get("Content-Type", "")
+    except requests.exceptions.RequestException as error:
+        return f"Error: {error}"
+    text = bytes(body).decode("utf-8", errors="replace")
+    if len(text) > HTTP_REQUEST_MAX_CHARS:
+        text = text[:HTTP_REQUEST_MAX_CHARS] + "\n...[truncated]"
+    return f"HTTP {status} {content_type}\n{text}"
+
+
+def _weather_code_text(code):
+    """What a WMO weather code means, in words."""
+    try:
+        code = int(code)
+    except (TypeError, ValueError):
+        return "unknown"
+    meanings = {
+        0: "clear sky",
+        1: "mainly clear",
+        2: "partly cloudy",
+        3: "overcast",
+        45: "fog",
+        48: "freezing fog",
+        51: "light drizzle",
+        53: "drizzle",
+        55: "heavy drizzle",
+        56: "freezing drizzle",
+        57: "freezing drizzle",
+        61: "light rain",
+        63: "rain",
+        65: "heavy rain",
+        66: "freezing rain",
+        67: "freezing rain",
+        71: "light snow",
+        73: "snow",
+        75: "heavy snow",
+        77: "snow grains",
+        80: "light showers",
+        81: "showers",
+        82: "heavy showers",
+        85: "snow showers",
+        86: "heavy snow showers",
+        95: "thunderstorm",
+        96: "thunderstorm with hail",
+        99: "thunderstorm with hail",
+    }
+    return meanings.get(code, "unknown")
+
+
+def _weather_summary_open_meteo(city, reason):
+    """The second try for the weather, when wttr.in does not answer."""
+    try:
+        response = _HTTP_SESSION.get(
+            OPEN_METEO_GEOCODE_URL,
+            params={"name": city, "count": 1},
+            timeout=HTTP_REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        places = response.json().get("results") or []
+        if not places:
+            return f"Error: no place called {city} was found"
+        place = places[0]
+        response = _HTTP_SESSION.get(
+            OPEN_METEO_FORECAST_URL,
+            params={
+                "latitude": place["latitude"],
+                "longitude": place["longitude"],
+                "current": "temperature_2m,weather_code,wind_speed_10m",
+                "daily": "temperature_2m_max,temperature_2m_min,weather_code",
+                "timezone": "auto",
+                "forecast_days": 3,
+            },
+            timeout=HTTP_REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        data = response.json()
+    except (requests.exceptions.RequestException, ValueError, KeyError) as error:
+        return f"Error: weather lookup failed: {reason} ({error})"
+    current = data.get("current") or {}
+    lines = [
+        f"{place.get('name', city)}: {_weather_code_text(current.get('weather_code'))}, "
+        f"{current.get('temperature_2m', '?')}C, "
+        f"wind {current.get('wind_speed_10m', '?')} km/h"
+    ]
+    daily = data.get("daily") or {}
+    days = daily.get("time") or []
+    lows = daily.get("temperature_2m_min") or []
+    highs = daily.get("temperature_2m_max") or []
+    codes = daily.get("weather_code") or []
+    for index, day in enumerate(days):
+        low = lows[index] if index < len(lows) else "?"
+        high = highs[index] if index < len(highs) else "?"
+        code = codes[index] if index < len(codes) else None
+        lines.append(f"{day}: {low}-{high}C, {_weather_code_text(code)}")
+    return "\n".join(lines)
+
+
+def weather(city):
+    """The weather somewhere, in a few lines she can read out loud.
+
+    wttr.in needs no key and answers in one request. It is slow the first
+    time a city is asked about, so open-meteo is the second try: the same
+    question, another service, still no key.
+    """
+    wanted = str(city or "").strip()
+    if not wanted:
+        return "Error: weather requires a city"
+    try:
+        response = _HTTP_SESSION.get(
+            WTTR_URL.format(
+                city=urllib.parse.quote(wanted.replace(" ", "+"), safe="+")
+            ),
+            timeout=HTTP_REQUEST_TIMEOUT,
+            headers={"User-Agent": "curl/8.0"},
+        )
+        response.raise_for_status()
+        data = response.json()
+    except requests.exceptions.RequestException as error:
+        return _weather_summary_open_meteo(wanted, error)
+    except ValueError:
+        return _weather_summary_open_meteo(
+            wanted, "the weather service sent something that was not JSON"
+        )
+    if not isinstance(data, dict) or data.get("error"):
+        return _weather_summary_open_meteo(wanted, "the weather service did not know that place")
+    current = (data.get("current_condition") or [{}])[0] or {}
+    description = ((current.get("weatherDesc") or [{}])[0] or {}).get("value", "unknown")
+    area = (data.get("nearest_area") or [{}])[0] or {}
+    place = ((area.get("areaName") or [{}])[0] or {}).get("value", wanted)
+    lines = [
+        f"{place}: {description}, {current.get('temp_C', '?')}C "
+        f"(feels like {current.get('FeelsLikeC', '?')}C), "
+        f"humidity {current.get('humidity', '?')}%, "
+        f"wind {current.get('windspeedKmph', '?')} km/h"
+    ]
+    for day in (data.get("weather") or [])[:3]:
+        hourly = day.get("hourly") or []
+        middle = hourly[len(hourly) // 2] if hourly else {}
+        mid_description = ((middle.get("weatherDesc") or [{}])[0] or {}).get(
+            "value", "unknown"
+        )
+        lines.append(
+            f"{day.get('date', '')}: {day.get('mintempC', '?')}-"
+            f"{day.get('maxtempC', '?')}C, {mid_description}"
+        )
+    return "\n".join(lines)
+
+
+def _news_line(item):
+    """One headline, with its score and where it can be read."""
+    title = str(item.get("title") or "").strip()
+    points = item.get("points")
+    if points is None:
+        points = item.get("score") or 0
+    link = item.get("url") or item.get("story_url") or ""
+    if not link and item.get("objectID"):
+        link = f"https://news.ycombinator.com/item?id={item['objectID']}"
+    if not link and item.get("id"):
+        link = f"https://news.ycombinator.com/item?id={item['id']}"
+    return f"- {title} ({points} points) {link}".strip()
+
+
+def _news_top(limit=10):
+    """The front page of Hacker News, as a list of items."""
+    response = _HTTP_SESSION.get(HN_TOP_STORIES_URL, timeout=HTTP_REQUEST_TIMEOUT)
+    response.raise_for_status()
+    items = []
+    for item_id in (response.json() or [])[:limit]:
+        try:
+            item = _HTTP_SESSION.get(
+                HN_ITEM_URL.format(id=item_id),
+                timeout=HTTP_REQUEST_TIMEOUT,
+            ).json()
+        except (requests.exceptions.RequestException, ValueError):
+            continue
+        if isinstance(item, dict) and item.get("title"):
+            items.append(item)
+    return items
+
+
+def _news_search(topic):
+    """Stories about a topic, by title search, or None when the search is down."""
+    try:
+        response = _HTTP_SESSION.get(
+            HN_SEARCH_URL,
+            params={"query": topic, "tags": "story", "hitsPerPage": 8},
+            timeout=HTTP_REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        return response.json().get("hits") or []
+    except (requests.exceptions.RequestException, ValueError):
+        return None
+
+
+def news(topic):
+    """The headlines, from Hacker News.
+
+    A topic is searched by title; "top" or nothing at all gives the front
+    page. It is the one free source that needs no key and no account, so it is
+    what she can always fall back on.
+    """
+    wanted = str(topic or "").strip()
+    generic = wanted.lower() in (
+        "",
+        "top",
+        "news",
+        "headlines",
+        "latest",
+        "general",
+        "today",
+    )
+    if generic:
+        try:
+            stories = _news_top()
+        except (requests.exceptions.RequestException, ValueError) as error:
+            return f"Error: news lookup failed: {error}"
+        if not stories:
+            return "Error: no headlines came back"
+        lines = ["Top stories on Hacker News right now:"]
+    else:
+        stories = _news_search(wanted)
+        if stories is None:
+            # The search endpoint did not answer, so the front page is read
+            # instead and the topic is matched against the titles there.
+            try:
+                stories = [
+                    item
+                    for item in _news_top(30)
+                    if wanted.lower() in str(item.get("title", "")).lower()
+                ]
+            except (requests.exceptions.RequestException, ValueError) as error:
+                return f"Error: news lookup failed: {error}"
+        if not stories:
+            return f"No Hacker News stories about {wanted} were found."
+        lines = [f"Hacker News stories about {wanted}:"]
+    for item in stories:
+        lines.append(_news_line(item))
+    return "\n".join(lines)
+
+
+def stock_price(symbol):
+    """What a share is doing right now.
+
+    Yahoo's chart endpoint is free and needs no key, so the price, the day's
+    change and the year's range are one request away.
+    """
+    wanted = str(symbol or "").strip().upper()
+    if not wanted:
+        return "Error: stock_price requires a symbol, like AAPL"
+    try:
+        response = _HTTP_SESSION.get(
+            YAHOO_CHART_URL.format(symbol=urllib.parse.quote(wanted)),
+            params={"range": "5d", "interval": "1d"},
+            timeout=HTTP_REQUEST_TIMEOUT,
+            headers={"User-Agent": HTTP_USER_AGENT},
+        )
+        response.raise_for_status()
+        chart = response.json().get("chart") or {}
+        if chart.get("error"):
+            return f"Error: no price for {wanted}"
+        results = chart.get("result") or []
+        if not results:
+            return f"Error: no price for {wanted}"
+        result = results[0]
+        meta = result.get("meta") or {}
+    except (requests.exceptions.RequestException, ValueError, AttributeError) as error:
+        return f"Error: price lookup failed: {error}"
+    price = meta.get("regularMarketPrice")
+    if price is None:
+        return f"Error: no price for {wanted}"
+    quote = (result.get("indicators") or {}).get("quote") or [{}]
+    closes = [
+        value
+        for value in (quote[0].get("close") or [])
+        if isinstance(value, (int, float))
+    ]
+    previous = closes[-2] if len(closes) >= 2 else None
+    if previous is None and isinstance(meta.get("fulldayChange"), (int, float)):
+        previous = price - meta["fulldayChange"]
+    if previous is None:
+        previous = meta.get("chartPreviousClose")
+    change = ""
+    if isinstance(previous, (int, float)) and previous:
+        difference = price - previous
+        percent = difference / previous * 100.0
+        sign = "+" if difference >= 0 else ""
+        change = f" ({sign}{difference:.2f}, {sign}{percent:.2f}% since {previous:.2f})"
+    name = meta.get("longName") or meta.get("shortName") or wanted
+    currency = meta.get("currency") or ""
+    lines = [f"{name} ({wanted}): {price:.2f} {currency}{change}".strip()]
+    day_low = meta.get("regularMarketDayLow")
+    day_high = meta.get("regularMarketDayHigh")
+    year_low = meta.get("fiftyTwoWeekLow")
+    year_high = meta.get("fiftyTwoWeekHigh")
+    if isinstance(day_low, (int, float)) and isinstance(day_high, (int, float)):
+        lines.append(f"Day range {day_low:.2f} - {day_high:.2f}")
+    if isinstance(year_low, (int, float)) and isinstance(year_high, (int, float)):
+        lines.append(f"52 week range {year_low:.2f} - {year_high:.2f}")
+    return "\n".join(lines)
+
+
+# -----------------------------
+# Text tools.
+#
+# The three that need a judgement - summarising, translating and reading the
+# mood of a text - ask the fast hosted model first, because the local one
+# needs minutes for work that is a chore rather than a conversation, and
+# because reading a text is exactly what it is good at. Each of them still
+# answers without a key: the fallbacks below are plain Python and are always
+# there, so a missing key costs quality rather than the tool itself.
+
+
+# How much of a text is worth reading. Past this the answer is about the
+# shape of the text rather than what it says, and the prompt grows for
+# nothing.
+TEXT_TOOL_MAX_CHARS = 8000
+# The QR service takes the text under "data". "text" is refused with a 400,
+# so the parameter name is the one that works rather than the one that reads
+# better.
+QR_CODE_API = "https://api.qrserver.com/v1/create-qr-code/"
+# The shortener takes the address under "url" and, with format=simple,
+# answers with the short link and nothing else.
+SHORTEN_URL_API = "https://is.gd/create.php"
+# The languages translate() knows by name, so it can tell which half of its
+# argument is the text and which half is the language, whichever order the
+# model wrote them in.
+LANGUAGE_NAMES = frozenset((
+    "english", "spanish", "french", "german", "italian", "portuguese",
+    "dutch", "swedish", "norwegian", "danish", "finnish", "polish", "czech",
+    "russian", "ukrainian", "greek", "turkish", "arabic", "hebrew", "persian",
+    "farsi", "hindi", "urdu", "bengali", "punjabi", "gujarati", "tamil",
+    "telugu", "marathi", "nepali", "sinhala", "thai", "lao", "khmer",
+    "vietnamese", "indonesian", "malay", "filipino", "tagalog", "chinese",
+    "mandarin", "cantonese", "japanese", "korean", "mongolian", "swahili",
+    "zulu", "afrikaans", "amharic", "somali", "hausa", "yoruba", "igbo",
+    "latin", "esperanto", "irish", "welsh", "scots", "yiddish",
+))
+# A link, with or without the scheme, in one pass so the links come back in
+# the order the text has them rather than grouped by shape.
+_TEXT_LINK_PATTERN = re.compile(r"(?:https?://|www\.)[^\s\"<>]+", re.IGNORECASE)
+# The words that carry no meaning of their own, so they are left out when
+# two sentences are compared.
+_TEXT_STOPWORDS = frozenset(
+    "the and that have for not with you this but from they say her she will "
+    "one all would there their what out about who get which when make can "
+    "like your our its been was were are had has did does into more some "
+    "such than then them these those being over under after before also just "
+    "very much many other same too only own while because each any few most "
+    "now here how why what did done get got go went come came".split()
+)
+# The words that say how someone feels, for the mood of a text when there is
+# no model to ask.
+_POSITIVE_WORDS = frozenset(
+    "good great love loved lovely like liked happy happier joy joyful glad "
+    "pleased proud excited amazing awesome wonderful fantastic brilliant best "
+    "better nice sweet kind fun hilarious cute beautiful helpful easy perfect "
+    "enjoy enjoyed thanks thank grateful win winning won success successful "
+    "delight delighted cheerful warm friendly calm hope hopeful".split()
+)
+_NEGATIVE_WORDS = frozenset(
+    "bad worse worst hate hated awful terrible sad sadder angry anger annoyed "
+    "annoying upset disappointed disappointing horrible painful pain hurt "
+    "hurts boring dull wrong fail failed failing broken dislike disaster stupid "
+    "ugly lonely afraid scared worried anxious sorry poor problem problems "
+    "issue issues crash crashed error errors".split()
+)
+
+
+def _fast_text_task(system, user, max_tokens=400, temperature=0.3, timeout=30):
+    """Ask the fast hosted model for one piece of work, or None if it is not there.
+
+    None means "no fast model", not "no answer": every caller here has a
+    plain Python fallback, so the difference between the two is a better
+    answer rather than an answer at all.
+    """
+    try:
+        answer = _fast_chat(
+            [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            max_tokens=max_tokens,
+            temperature=temperature,
+            timeout=timeout,
+        )
+    except Exception as error:
+        print(f"Fast model could not be used for this ({error}).")
+        return None
+    if not answer:
+        return None
+    text = str(answer.get("text") or "").strip()
+    return text or None
+
+
+def _content_words(sentence):
+    """The words of a sentence that carry meaning, for comparing sentences."""
+    return [
+        word
+        for word in re.findall(r"[a-z0-9']+", str(sentence or "").lower())
+        if len(word) > 2 and word not in _TEXT_STOPWORDS
+    ]
+
+
+def _summary_arg(arg):
+    """The text to summarise and how many sentences to keep.
+
+    The model sends one string argument, so the sentence count rides on the
+    end of the text after a pipe. Only a number counts as a count, so a text
+    with a pipe in it is still a text.
+    """
+    raw = str(arg or "").strip()
+    count = 3
+    if "|" in raw:
+        head, _, tail = raw.rpartition("|")
+        tail = tail.strip()
+        if tail.isdigit() and head.strip():
+            count = int(tail)
+            raw = head.strip()
+    return raw, count
+
+
+def _translate_arg(arg):
+    """The text to translate and the language to translate it into.
+
+    The language is whichever half of the argument names one, so the model
+    can write the two in either order and still be understood.
+    """
+    raw = str(arg or "").strip()
+    if "|" not in raw:
+        # A lone language name is a language with no text, rather than a text
+        # with no language, so the error says which half is missing.
+        if raw.lower() in LANGUAGE_NAMES:
+            return "", raw
+        return raw, ""
+    parts = [part.strip() for part in raw.split("|")]
+    for index in range(len(parts) - 1, -1, -1):
+        if parts[index].lower() in LANGUAGE_NAMES:
+            language = parts.pop(index)
+            return "|".join(parts).strip(), language
+    language = parts.pop()
+    return "|".join(parts).strip(), language
+
+
+def _key_sentences(text, count):
+    """The sentences that say the most about a text, without asking a model.
+
+    A sentence is worth more when the words in it turn up elsewhere in the
+    text: a name or a number that appears once is a detail, and a word that
+    appears in every sentence is the subject of the whole thing.
+    """
+    sentences = [
+        part.strip() for part in _SENTENCE_SPLIT_PATTERN.split(text) if part.strip()
+    ]
+    if not sentences:
+        return text[:400]
+    if len(sentences) <= count:
+        return " ".join(sentences)
+    counts = collections.Counter()
+    for sentence in sentences:
+        counts.update(set(_content_words(sentence)))
+    scored = []
+    for index, sentence in enumerate(sentences):
+        words = set(_content_words(sentence))
+        if not words:
+            continue
+        shared = sum(counts[word] for word in words)
+        # How much of itself is made of words the rest of the text also uses,
+        # and how much of the text those words account for.
+        score = shared / len(words) + shared / (len(sentences) * 2)
+        scored.append((score, index, sentence))
+    if not scored:
+        return " ".join(sentences[:count])
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    best = sorted(scored[:count], key=lambda item: item[1])
+    return " ".join(item[2] for item in best)
+
+
+def _word_sentiment(text):
+    """The mood of a text, counted from the words in it."""
+    words = re.findall(r"[a-z']+", str(text or "").lower())
+    positive = sum(1 for word in words if word in _POSITIVE_WORDS)
+    negative = sum(1 for word in words if word in _NEGATIVE_WORDS)
+    if positive == negative:
+        return "neutral - the words lean neither way."
+    if positive > negative:
+        return f"positive - {positive} happy words against {negative} unhappy ones."
+    return f"negative - {negative} unhappy words against {positive} happy ones."
+
+
+def summarize(text, max_sentences=3):
+    """Summarise a long text in a few sentences.
+
+    The fast model does this properly when one is configured. Without one the
+    key sentences are picked by how much they share with the rest of the
+    text, which is a rougher answer but still a summary rather than a
+    refusal.
+    """
+    text = str(text or "").strip()
+    if not text:
+        return "Error: summarize requires some text"
+    try:
+        count = max(1, min(int(max_sentences), 10))
+    except (TypeError, ValueError):
+        count = 3
+    body = text[:TEXT_TOOL_MAX_CHARS]
+    answer = _fast_text_task(
+        "You are a precise summariser. Answer with the summary only: no "
+        "preamble, no quotation marks, no notes about what you did.",
+        f"Summarise the text below in at most {count} sentences. Keep the main "
+        "points, the names and the numbers, and leave out the padding.\n\n"
+        f"Text:\n{body}",
+        max_tokens=400,
+        temperature=0.3,
+    )
+    if answer:
+        return answer
+    return _key_sentences(body, count)
+
+
+def translate(text, target_language):
+    """Translate text into another language."""
+    text = str(text or "").strip()
+    language = str(target_language or "").strip()
+    if not text:
+        return "Error: translate requires some text"
+    if not language:
+        return (
+            "Error: translate requires a target language, "
+            "like translate(text|Spanish)"
+        )
+    body = text[:TEXT_TOOL_MAX_CHARS]
+    answer = _fast_text_task(
+        "You are a translator. Answer with the translation only: no preamble, "
+        "no quotation marks, no notes.",
+        f"Translate the text below into {language}. Keep the meaning, the "
+        "names and the line breaks.\n\n"
+        f"Text:\n{body}",
+        max_tokens=800,
+        temperature=0.2,
+    )
+    if answer:
+        return answer
+    return (
+        "I have no translator available right now, so this is still the "
+        f"original text:\n{text}"
+    )
+
+
+def sentiment(text):
+    """Whether a text is positive, neutral or negative."""
+    text = str(text or "").strip()
+    if not text:
+        return "Error: sentiment requires some text"
+    body = text[:TEXT_TOOL_MAX_CHARS]
+    answer = _fast_text_task(
+        "You read the mood of a piece of text. Answer with one word - positive, "
+        "neutral or negative - and then one short sentence saying why. "
+        "Nothing else.",
+        f"What is the sentiment of the text below?\n\nText:\n{body}",
+        max_tokens=120,
+        temperature=0.2,
+    )
+    if answer:
+        return answer
+    return _word_sentiment(text)
+
+
+def word_count(text):
+    """How much text there is: words, characters, sentences and paragraphs."""
+    text = str(text or "")
+    if not text.strip():
+        return "Error: word_count requires some text"
+    words = re.findall(r"[\w'-]+", text)
+    sentences = [
+        part.strip() for part in _SENTENCE_SPLIT_PATTERN.split(text.strip())
+        if part.strip()
+    ]
+    paragraphs = [
+        part.strip() for part in re.split(r"\n\s*\n", text.strip()) if part.strip()
+    ]
+    without_spaces = len("".join(text.split()))
+    return "\n".join([
+        f"Words: {len(words)}",
+        f"Characters: {len(text)} ({without_spaces} without spaces)",
+        f"Sentences: {len(sentences)}",
+        f"Paragraphs: {len(paragraphs)}",
+    ])
+
+
+def extract_links(text):
+    """Every link in a text, in the order the text has them."""
+    text = str(text or "")
+    if not text.strip():
+        return "Error: extract_links requires some text"
+    found = []
+    for match in _TEXT_LINK_PATTERN.findall(text):
+        cleaned = match.rstrip(".,;:!?)]}>'\"")
+        if cleaned and cleaned not in found:
+            found.append(cleaned)
+    if not found:
+        return "No links in that text."
+    return "\n".join([f"Found {len(found)} link(s):"] + found)
+
+
+def qr_code(text):
+    """A QR code for a piece of text.
+
+    Made here when the qrcode library is installed, so the picture is a data
+    URL that can be shown or saved anywhere. Without it the code is made by a
+    free service and the address of the picture is given instead.
+    """
+    text = str(text or "").strip()
+    if not text:
+        return "Error: qr_code requires some text"
+    try:
+        import qrcode
+    except ImportError:
+        qrcode = None
+    if qrcode is not None:
+        try:
+            import base64
+            import io
+
+            buffer = io.BytesIO()
+            qrcode.make(text).save(buffer, format="PNG")
+            encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+            return f"data:image/png;base64,{encoded}"
+        except Exception as error:
+            return f"Error: the QR code could not be made: {error}"
+    url = QR_CODE_API + "?" + urllib.parse.urlencode({"size": "200x200", "data": text})
+    return f"QR code for that text: {url}"
+
+
+def shorten_url(url):
+    """A short link for a long one."""
+    url = str(url or "").strip()
+    if not url:
+        return "Error: shorten_url requires a URL"
+    if "://" not in url:
+        url = "https://" + url
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return (
+            f"Error: only http and https links can be shortened, "
+            f"not {parsed.scheme or 'that one'}"
+        )
+    host = parsed.hostname or ""
+    if not host or not _http_host_is_public(host):
+        return "Error: that link cannot be shortened"
+    try:
+        response = _HTTP_SESSION.get(
+            SHORTEN_URL_API,
+            params={"format": "simple", "url": url},
+            timeout=HTTP_REQUEST_TIMEOUT,
+            headers={"User-Agent": HTTP_USER_AGENT},
+        )
+        response.raise_for_status()
+        shortened = (response.text or "").strip()
+    except requests.exceptions.RequestException as error:
+        return f"Error: the link could not be shortened: {error}"
+    if not shortened.startswith("http"):
+        return f"Error: the shortener said: {shortened}"
+    return f"Short link: {shortened}"
+
+
+
+# -----------------------------
+# Picture tools and the little number tools. Pillow does the real work when
+# it is installed; without it the information tools still answer from the file
+# itself and the editing ones say plainly that they cannot.
+IMAGE_MAX_BYTES = 25 * 1024 * 1024
+IMAGE_DOWNLOAD_TIMEOUT = 30
+IMAGE_FORMATS = {
+    "png": ("PNG", ".png"),
+    "jpg": ("JPEG", ".jpg"),
+    "jpeg": ("JPEG", ".jpg"),
+    "webp": ("WEBP", ".webp"),
+}
+HASH_ALGORITHMS = ("md5", "sha1", "sha256", "sha512")
+
+
+def _pil_image():
+    """The Pillow Image module, or None when Pillow is not installed."""
+    try:
+        from PIL import Image
+    except Exception:
+        return None
+    return Image
+
+
+def _split_image_call(arg, expected):
+    """Split a tool argument into its parts.
+
+    The pipe is the separator the other multi-part tools use and a comma is
+    accepted as well, but a comma inside a web address would then be mistaken
+    for a separator, so the numbers are taken from the end of the argument.
+    """
+    text = str(arg or "")
+    if "|" in text:
+        parts = [part.strip() for part in text.split("|")]
+        separator = "|"
+    else:
+        parts = [part.strip() for part in text.split(",")]
+        separator = ","
+    if len(parts) < expected:
+        return None
+    head = separator.join(parts[: len(parts) - expected + 1])
+    return [head] + parts[len(parts) - expected + 1:]
+
+
+def _download_image(url):
+    """Fetch a picture into a temporary file, refusing anything too big."""
+    try:
+        with _HTTP_SESSION.get(
+            url,
+            timeout=IMAGE_DOWNLOAD_TIMEOUT,
+            stream=True,
+            headers={"User-Agent": HTTP_USER_AGENT},
+        ) as response:
+            response.raise_for_status()
+            length = response.headers.get("Content-Length", "")
+            if length.isdigit() and int(length) > IMAGE_MAX_BYTES:
+                return None, False, "Error: that picture is too big to download"
+            body = bytearray()
+            for chunk in response.iter_content(8192):
+                body.extend(chunk)
+                if len(body) > IMAGE_MAX_BYTES:
+                    return None, False, "Error: that picture is too big to download"
+    except requests.exceptions.RequestException as error:
+        return None, False, f"Error: the picture could not be downloaded: {error}"
+    suffix = os.path.splitext(urllib.parse.urlparse(url).path)[1].lower()
+    if not re.fullmatch(r"\.[a-z0-9]{1,8}", suffix):
+        suffix = ".img"
+    handle = tempfile.NamedTemporaryFile(prefix="kookie_pic_", suffix=suffix, delete=False)
+    try:
+        handle.write(bytes(body))
+    finally:
+        handle.close()
+    return handle.name, True, ""
+
+
+def _resolve_image_source(url_or_path):
+    """(path, is_temporary, error) for a picture address or a local file."""
+    source = str(url_or_path or "").strip()
+    if not source:
+        return None, False, "Error: a picture address or path is required"
+    if source.lower().startswith(("http://", "https://")):
+        parsed = urllib.parse.urlparse(source)
+        host = parsed.hostname or ""
+        if not host or not _http_host_is_public(host):
+            return None, False, "Error: local and private network addresses are not fetched"
+        return _download_image(source)
+    path = _safe_path(source)
+    if path is None:
+        return None, False, "Error: that path is outside the folder I am allowed to read"
+    if not os.path.isfile(path):
+        return None, False, "Error: there is no picture at that path"
+    return path, False, ""
+
+
+def _drop_temp_image(path, is_temporary):
+    """Take away a picture that was only downloaded for one look."""
+    if is_temporary and path:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _save_image(image, prefix, suffix):
+    """Write a picture into /tmp and say where it landed."""
+    handle = tempfile.NamedTemporaryFile(
+        prefix="kookie_%s_" % prefix, suffix=suffix, dir="/tmp", delete=False
+    )
+    path = handle.name
+    handle.close()
+    image.save(path)
+    return path
+
+
+def _human_size(size):
+    if size < 1024:
+        return "%d bytes" % size
+    if size < 1024 * 1024:
+        return "%.1f KB" % (size / 1024)
+    return "%.1f MB" % (size / (1024 * 1024))
+
+
+def image_info(url_or_path):
+    """What a picture is: how big, what format, how heavy."""
+    path, is_temporary, error = _resolve_image_source(url_or_path)
+    if error:
+        return error
+    try:
+        file_size = os.path.getsize(path)
+        Image = _pil_image()
+        if Image is None:
+            fmt = os.path.splitext(path)[1].lstrip(".").upper() or "unknown"
+            return "\n".join([
+                "File: %s" % path,
+                "Format: %s (from the file name, Pillow is not installed)" % fmt,
+                "Size on disk: %s (%d bytes)" % (_human_size(file_size), file_size),
+            ])
+        with Image.open(path) as image:
+            width, height = image.size
+            fmt = (image.format or "unknown").upper()
+            mode = image.mode
+        return "\n".join([
+            "File: %s" % path,
+            "Format: %s" % fmt,
+            "Dimensions: %d x %d pixels" % (width, height),
+            "Colour mode: %s" % mode,
+            "Size on disk: %s (%d bytes)" % (_human_size(file_size), file_size),
+        ])
+    except Exception as error:
+        return "Error: that picture could not be read: %s" % error
+    finally:
+        _drop_temp_image(path, is_temporary)
+
+
+def resize_image(url_or_path, width, height):
+    """Make a copy of a picture at another size."""
+    Image = _pil_image()
+    if Image is None:
+        return "Error: resizing needs Pillow, which is not installed"
+    try:
+        new_width = int(float(str(width).strip()))
+        new_height = int(float(str(height).strip()))
+    except (TypeError, ValueError):
+        return "Error: resize_image needs a width and a height as numbers"
+    if new_width <= 0 or new_height <= 0:
+        return "Error: the new width and height have to be more than zero"
+    path, is_temporary, error = _resolve_image_source(url_or_path)
+    if error:
+        return error
+    try:
+        with Image.open(path) as image:
+            image.load()
+            old_width, old_height = image.size
+            resized = image.resize((new_width, new_height))
+            output = _save_image(resized, "resize", ".png")
+        return "\n".join([
+            "Resized from %dx%d to %dx%d" % (old_width, old_height, new_width, new_height),
+            "Saved to %s" % output,
+        ])
+    except Exception as error:
+        return "Error: that picture could not be resized: %s" % error
+    finally:
+        _drop_temp_image(path, is_temporary)
+
+
+def crop_image(url_or_path, x1, y1, x2, y2):
+    """Cut a rectangle out of a picture."""
+    Image = _pil_image()
+    if Image is None:
+        return "Error: cropping needs Pillow, which is not installed"
+    numbers = []
+    for value in (x1, y1, x2, y2):
+        try:
+            numbers.append(int(float(str(value).strip())))
+        except (TypeError, ValueError):
+            return "Error: crop_image needs four numbers: x1, y1, x2, y2"
+    left, top, right, bottom = numbers
+    path, is_temporary, error = _resolve_image_source(url_or_path)
+    if error:
+        return error
+    try:
+        with Image.open(path) as image:
+            image.load()
+            width, height = image.size
+            left = max(0, min(left, width))
+            right = max(0, min(right, width))
+            top = max(0, min(top, height))
+            bottom = max(0, min(bottom, height))
+            if right <= left or bottom <= top:
+                return "Error: that rectangle is empty, so there is nothing to crop"
+            cropped = image.crop((left, top, right, bottom))
+            output = _save_image(cropped, "crop", ".png")
+        return "\n".join([
+            "Cropped to %dx%d pixels" % (right - left, bottom - top),
+            "Saved to %s" % output,
+        ])
+    except Exception as error:
+        return "Error: that picture could not be cropped: %s" % error
+    finally:
+        _drop_temp_image(path, is_temporary)
+
+
+def convert_image(url_or_path, image_format):
+    """Turn a picture into another format."""
+    Image = _pil_image()
+    if Image is None:
+        return "Error: converting needs Pillow, which is not installed"
+    name = str(image_format or "").strip().lower().lstrip(".")
+    if name not in IMAGE_FORMATS:
+        return "Error: I can convert a picture to png, jpg or webp"
+    pillow_format, suffix = IMAGE_FORMATS[name]
+    path, is_temporary, error = _resolve_image_source(url_or_path)
+    if error:
+        return error
+    try:
+        with Image.open(path) as image:
+            image.load()
+            if pillow_format == "JPEG" and image.mode not in ("RGB", "L"):
+                image = image.convert("RGB")
+            output = _save_image(image, "convert", suffix)
+        return "\n".join([
+            "Converted to %s" % pillow_format,
+            "Saved to %s" % output,
+        ])
+    except Exception as error:
+        return "Error: that picture could not be converted: %s" % error
+    finally:
+        _drop_temp_image(path, is_temporary)
+
+
+def encode_base64(text):
+    """Text turned into base64."""
+    import base64
+
+    text = str(text or "")
+    if not text:
+        return "Error: encode_base64 requires some text"
+    return base64.b64encode(text.encode("utf-8")).decode("ascii")
+
+
+def decode_base64(text):
+    """Base64 turned back into text."""
+    import base64
+
+    cleaned = "".join(str(text or "").split())
+    if not cleaned:
+        return "Error: decode_base64 requires some text"
+    padded = cleaned + "=" * (-len(cleaned) % 4)
+    try:
+        decoded = base64.b64decode(padded, validate=True).decode("utf-8", errors="replace")
+    except Exception as error:
+        return "Error: that is not valid base64: %s" % error
+    return decoded
+
+
+def hash_text(text, algorithm="sha256"):
+    """The hash of some text."""
+    import hashlib
+
+    text = str(text or "")
+    if not text:
+        return "Error: hash_text requires some text"
+    name = str(algorithm or "sha256").strip().lower()
+    if name not in HASH_ALGORITHMS:
+        return "Error: I can hash with md5, sha1, sha256 or sha512"
+    digest = hashlib.new(name)
+    digest.update(text.encode("utf-8"))
+    return "%s: %s" % (name, digest.hexdigest())
+
+
+def uuid():
+    """A random identifier."""
+    import uuid as uuid_module
+
+    return str(uuid_module.uuid4())
+
+
+def timestamp():
+    """The time now, as a number and as a date."""
+    from datetime import timezone
+
+    now = time.time()
+    return "\n".join([
+        "Unix timestamp: %d" % int(now),
+        "Local time: %s" % datetime.fromtimestamp(now).strftime("%Y-%m-%d %H:%M:%S"),
+        "UTC time: %s" % datetime.fromtimestamp(now, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+    ])
+
+
+def _image_tool_call(func, arg, expected):
+    """Hand the parts of an image tool argument to the tool."""
+    parts = _split_image_call(arg, expected)
+    if parts is None:
+        return "Error: %s needs %d parts separated by | or ," % (func.__name__, expected)
+    return func(*parts)
+
+
+def _hash_tool_call(arg):
+    """hash_text(text|algorithm), where the algorithm is optional."""
+    text = str(arg or "")
+    if "|" in text:
+        parts = _split_pipe(text, 2)
+        return hash_text(parts[0], parts[1])
+    return hash_text(text)
+
+
+
+
+def set_reminder(text, delay_minutes):
+    try:
+        delay = int(str(delay_minutes).strip())
+    except (ValueError, TypeError):
+        return "Error: delay_minutes must be an integer"
+    try:
+        path_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kookie_reminders.json")
+        data = []
+        if os.path.exists(path_file):
+            with open(path_file, "r", encoding="utf-8") as f:
+                try:
+                    data = json.load(f)
+                except (ValueError, json.JSONDecodeError):
+                    data = []
+        due = datetime.now() + timedelta(minutes=delay)
+        entry = {"text": str(text), "due": due.isoformat(), "created": datetime.now().isoformat()}
+        data.append(entry)
+        with open(path_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        return f"Reminder set: '{text}' in {delay} minutes (due {due.isoformat()})"
+    except Exception as e:
+        return f"Error setting reminder: {e}"
+
+
+def list_reminders():
+    try:
+        path_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kookie_reminders.json")
+        if not os.path.exists(path_file):
+            return "No reminders."
+        with open(path_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not data:
+            return "No reminders."
+        lines = []
+        for r in data:
+            lines.append(f"- {r.get('text','')} (due {r.get('due','')})")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error listing reminders: {e}"
+
+
+def convert_units(value, from_unit, to_unit):
+    try:
+        v = float(value)
+        f = str(from_unit).strip().lower()
+        t = str(to_unit).strip().lower()
+        # lengths in meters
+        length = {"m":1.0,"meter":1.0,"meters":1.0,"km":1000.0,"cm":0.01,"mm":0.001,"mi":1609.344,"mile":1609.344,"miles":1609.344,"ft":0.3048,"foot":0.3048,"feet":0.3048,"in":0.0254,"inch":0.0254,"inches":0.0254,"yd":0.9144,"yard":0.9144,"yards":0.9144}
+        weight = {"kg":1.0,"kilogram":1.0,"kilograms":1.0,"g":0.001,"gram":0.001,"grams":0.001,"mg":1e-6,"lb":0.45359237,"pound":0.45359237,"pounds":0.45359237,"oz":0.028349523125,"ounce":0.028349523125,"ounces":0.028349523125}
+        volume = {"l":1.0,"liter":1.0,"liters":1.0,"ml":0.001,"m3":1000.0,"gal":3.785411784,"gallon":3.785411784,"gallons":3.785411784,"qt":0.946352946,"quart":0.946352946,"quarts":0.946352946,"pt":0.473176473,"pint":0.473176473,"pints":0.473176473,"cup":0.2365882365,"cups":0.2365882365}
+        timeu = {"s":1.0,"sec":1.0,"second":1.0,"seconds":1.0,"min":60.0,"minute":60.0,"minutes":60.0,"h":3600.0,"hr":3600.0,"hour":3600.0,"hours":3600.0,"d":86400.0,"day":86400.0,"days":86400.0}
+        if f in length and t in length:
+            return str(v * length[f] / length[t])
+        if f in weight and t in weight:
+            return str(v * weight[f] / weight[t])
+        if f in volume and t in volume:
+            return str(v * volume[f] / volume[t])
+        if f in timeu and t in timeu:
+            return str(v * timeu[f] / timeu[t])
+        # temperature
+        def to_c(x,u):
+            if u in ("c","celsius"): return x
+            if u in ("f","fahrenheit"): return (x-32)*5/9
+            if u in ("k","kelvin"): return x-273.15
+            raise ValueError
+        def from_c(x,u):
+            if u in ("c","celsius"): return x
+            if u in ("f","fahrenheit"): return x*9/5+32
+            if u in ("k","kelvin"): return x+273.15
+            raise ValueError
+        if f in ("c","celsius","f","fahrenheit","k","kelvin") and t in ("c","celsius","f","fahrenheit","k","kelvin"):
+            return str(from_c(to_c(v,f),t))
+        return f"Error: unsupported units {from_unit}->{to_unit}"
+    except Exception as e:
+        return f"Error converting: {e}"
+
+
+def calculate_distance(lat1, lon1, lat2, lon2):
+    try:
+        la1=float(lat1); lo1=float(lon1); la2=float(lat2); lo2=float(lon2)
+        R=6371.0
+        p1=math.radians(la1); p2=math.radians(la2)
+        dphi=math.radians(la2-la1); dlmb=math.radians(lo2-lo1)
+        a=math.sin(dphi/2)**2 + math.cos(p1)*math.cos(p2)*math.sin(dlmb/2)**2
+        c=2*math.atan2(math.sqrt(a), math.sqrt(1-a))
+        return f"{R*c:.3f} km"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def time_between(time1, time2):
+    try:
+        t1=datetime.fromisoformat(str(time1).replace("Z","+00:00"))
+        t2=datetime.fromisoformat(str(time2).replace("Z","+00:00"))
+        delta=t2-t1
+        return str(delta)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def get_system_info():
+    try:
+        import platform
+        info = []
+        info.append("OS: " + platform.system() + " " + platform.release())
+        info.append("Machine: " + platform.machine())
+        try:
+            import psutil
+            info.append("CPU: " + str(psutil.cpu_percent(interval=0.5)) + "%")
+            mem = psutil.virtual_memory()
+            info.append(f"Mem: {mem.used//1024//1024}MB/{mem.total//1024//1024}MB")
+            disk = psutil.disk_usage("/")
+            info.append(f"Disk: {disk.used//1024//1024}MB/{disk.total//1024//1024}MB")
+        except Exception:
+            pass
+        return "\n".join(info)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def set_volume(level):
+    try:
+        lvl=int(float(level))
+        lvl=max(0,min(100,lvl))
+        try:
+            subprocess.run(["pactl","set-sink-volume","@DEFAULT_SINK@",f"{lvl}%"], check=True)
+            return f"Volume set to {lvl}%"
+        except Exception:
+            subprocess.run(["amixer","set","Master",f"{lvl}%"], check=True)
+            return f"Volume set to {lvl}%"
+    except Exception as e:
+        return f"Error setting volume: {e}"
+
+
+def set_brightness(level):
+    try:
+        lvl=int(float(level))
+        lvl=max(0,min(100,lvl))
+        # try xrandr
+        try:
+            out=subprocess.check_output(["xrandr","--listmonitors"], text=True)
+            # find first output name
+            import re
+            m=re.search(r"\+\S+\s+\d+/\d+x\d+/\d+\+\d+\+\d+\s+(\S+)", out)
+            if m:
+                disp=m.group(1)
+                subprocess.run(["xrandr","--output",disp,"--brightness",str(lvl/100.0)], check=True)
+                return f"Brightness set to {lvl}%"
+        except Exception:
+            pass
+        # /sys fallback
+        for base in ["/sys/class/backlight"]:
+            if os.path.isdir(base):
+                for d in os.listdir(base):
+                    p=os.path.join(base,d,"brightness")
+                    mx=os.path.join(base,d,"max_brightness")
+                    if os.path.exists(p) and os.path.exists(mx):
+                        with open(mx) as f: maximum=int(f.read().strip())
+                        with open(p,"w") as f: f.write(str(int(maximum*lvl/100.0)))
+                        return f"Brightness set to {lvl}%"
+        return "Error: no brightness control found"
+    except Exception as e:
+        return f"Error setting brightness: {e}"
+
+
+
 TOOL_FUNCTIONS = {
     "list_code_files": lambda arg: list_code_files(),
     "search_code": lambda arg: search_code(arg),
@@ -7225,9 +8903,35 @@ TOOL_FUNCTIONS = {
     "sing": lambda arg: sing(arg),
     "how_to_sing": lambda arg: how_to_sing(),
     "browse": lambda arg: browse(arg),
+    "http_request": lambda arg: http_request(arg),
+    "weather": lambda arg: weather(arg),
+    "news": lambda arg: news(arg),
+    "stock_price": lambda arg: stock_price(arg),
+    "summarize": lambda arg: summarize(*_summary_arg(arg)),
+    "translate": lambda arg: translate(*_translate_arg(arg)),
+    "sentiment": lambda arg: sentiment(arg),
+    "word_count": lambda arg: word_count(arg),
+    "extract_links": lambda arg: extract_links(arg),
+    "qr_code": lambda arg: qr_code(arg),
+    "shorten_url": lambda arg: shorten_url(arg),
+    "image_info": lambda arg: image_info(arg),
+    "resize_image": lambda arg: _image_tool_call(resize_image, arg, 3),
+    "crop_image": lambda arg: _image_tool_call(crop_image, arg, 5),
+    "convert_image": lambda arg: _image_tool_call(convert_image, arg, 2),
+    "encode_base64": lambda arg: encode_base64(arg),
+    "decode_base64": lambda arg: decode_base64(arg),
+    "hash_text": lambda arg: _hash_tool_call(arg),
+    "uuid": lambda arg: uuid(),
+    "timestamp": lambda arg: timestamp(),
     "watch_video": lambda arg: watch_video(arg),
     "listen_video": lambda arg: listen_video(arg),
     "generate_image": lambda arg: generate_image(arg),
+    "run_command": lambda arg: run_command(arg),
+    "run_python": lambda arg: run_python(arg),
+    "list_files": lambda arg: list_files(arg),
+    "read_file": lambda arg: read_file(arg),
+    "delete_file": lambda arg: delete_file(arg),
+    "copy_file": lambda arg: copy_file(arg),
     "draw": lambda arg: generate_image(arg),
     "remember_face": lambda arg: __import__("video_perception").remember_face(arg),
     "hum": lambda arg: hum(arg),
@@ -7236,6 +8940,14 @@ TOOL_FUNCTIONS = {
     "hum_spotify": lambda arg: _hum_spotify_for(arg),
     "think": lambda arg: think(arg),
     "analyze": lambda arg: analyze(arg),
+    "set_reminder": lambda arg: set_reminder(*_split_pipe(arg, 2)),
+    "list_reminders": lambda arg: list_reminders(),
+    "convert_units": lambda arg: convert_units(*_split_pipe(arg, 3)),
+    "calculate_distance": lambda arg: calculate_distance(*_split_pipe(arg, 4)),
+    "time_between": lambda arg: time_between(*_split_pipe(arg, 2)),
+    "get_system_info": lambda arg: get_system_info(),
+    "set_volume": lambda arg: set_volume(arg),
+    "set_brightness": lambda arg: set_brightness(arg),
     "system_status": lambda arg: system_status(),
     "code_status": lambda arg: code_status(),
     # Not in TOOL_PROMPT on purpose: both are expensive per call and neither is
