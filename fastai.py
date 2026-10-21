@@ -52,8 +52,12 @@ PROVIDERS = (
         "GEMINI_API_KEY",
         "https://generativelanguage.googleapis.com/v1beta/openai",
         (
-            # Primary: the fast, cheap Flash-Lite (alias to current Flash-Lite)
-            "gemini-3.5-flash-lite",
+            # Primary: Gemini 3 Flash Preview - fast, smart, free tier
+            "gemini-3-flash-preview",
+            # Gemini 3.1 Pro Preview - much smarter (paid tier)
+            "gemini-3.1-pro-preview",
+            # Gemini 3.1 Flash Lite - fastest, cheapest
+            "gemini-3.1-flash-lite",
             # Alias rather than a dated ID: Google keeps flash-latest pointing at
             # the current Flash, so it cannot be retired out from under this.
             "gemini-flash-latest",
@@ -71,10 +75,11 @@ PROVIDERS = (
             # Fastest thing on the platform, and good enough for the envelopes and
             # the tool calls. Listed first on purpose: the whole point of this
             # module is that she answers quickly.
-            "openai/gpt-oss-20b",
-            # Twice the size for when the smaller one gets something wrong.
             "openai/gpt-oss-120b",
+            # Twice the size for when the smaller one gets something wrong.
             "qwen/qwen3.6-27b",
+            "llama-3.3-70b-versatile",
+            "mistral-7b-v0.3",
         ),
         "Groq",
     ),
@@ -101,8 +106,10 @@ if _FAST_PROVIDER_OVERRIDE and _FAST_PROVIDER_OVERRIDE not in PROVIDER_ORDER:
 # a cold connect, a provider that is briefly down, a free tier that rate limits
 # under a burst of thoughts. None of those should look like a crash to the
 # caller, so timeouts are tight and everything else is left to the local model.
-DEFAULT_TIMEOUT = 30
-CONNECT_TIMEOUT = 10
+# 60s rather than 30s: Gemini 3 Flash Preview is slower on the free tier than
+# the old Flash-Lite, and 30s was timing out on every reply.
+DEFAULT_TIMEOUT = 60
+CONNECT_TIMEOUT = 15
 
 _SESSION = requests.Session()
 

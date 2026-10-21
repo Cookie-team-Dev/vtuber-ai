@@ -35,10 +35,14 @@ LEARNING_FILE = "kookie_learning.json"
 # in controller.py, and these are the ceilings that decide whether it ever needs
 # trimming: a web claim costs context, and a personality she cannot see is a
 # personality that does not shape anything.
-WEB_CONTEXT_MAX_ITEMS = 8
-WEB_CONTEXT_CHAR_BUDGET = 1200
-OWN_MIND_MAX_ITEMS = 8
-OWN_MIND_CHAR_BUDGET = 700
+# With the 16K context window, there is room for much more of her own mind.
+# 24 rather than 8: a bigger model can hold more personality in a prompt
+# without losing coherence, and the old 8 was starving her of her own
+# opinions and preferences.
+WEB_CONTEXT_MAX_ITEMS = 24
+WEB_CONTEXT_CHAR_BUDGET = 3600
+OWN_MIND_MAX_ITEMS = 24
+OWN_MIND_CHAR_BUDGET = 2100
 
 # Hard caps on what may ever be kept, so a long night of learning cannot grow
 # the file without bound or make the prompt crawl.
@@ -53,7 +57,10 @@ MAX_TOPIC_CHARS = 80
 # songs and the facts she was told, so the ceiling has to be above that or the
 # export is a random slice of it. Still bounded: this is a file that gets
 # rewritten on every save.
-MAX_CORPUS_ROWS = 4000
+# 12000 rather than 4000: with a 16K context window and a bigger model, the old
+# cap was throwing away 80% of her training data. This is still bounded - the
+# file is rewritten on every save, but the rewrite is fast enough.
+MAX_CORPUS_ROWS = 12000
 
 # A seeded row is not capped as tightly as a distilled claim. A reply is up to
 # remember_event()'s 400 characters and a song is however long its words are, and

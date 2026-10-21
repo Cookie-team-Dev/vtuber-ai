@@ -186,7 +186,12 @@ VTS_RECONNECT_SECONDS = 15
 # curiosity. Five minutes keeps her thinking, and keeps the model mostly free.
 IDLE_INTERVAL_SECONDS = 5 * 60
 # How long after Mommy speaks her background thinking stays out of the way.
-RECENT_CHAT_QUIET_SECONDS = 90
+# 30 rather than 90 seconds: the old 90 meant Kookie would start a fresh
+    # autonomous thought 90 seconds after the last message, and if someone
+    # messaged her at second 89 she would interrupt mid-thought. With 30 she
+    # waits long enough to be useful but short enough that a ping always
+    # preempts her own work.
+RECENT_CHAT_QUIET_SECONDS = 30
 KOOKIE_TZ = "Asia/Phnom_Penh"
 
 # The JSON envelope costs far more tokens than the reply it wraps (thinking_summary,
@@ -211,7 +216,7 @@ KOOKIE_TZ = "Asia/Phnom_Penh"
 # on an ordinary turn, so this is headroom rather than an invitation to write more.
 # The prompt lost 70 tokens of it to PROMPT_TOKEN_BUDGET below, which is where the
 # trade is made deliberately.
-REPLY_TOKEN_BUDGET = 240
+REPLY_TOKEN_BUDGET = 512
 # Deliberately not trimmed. This envelope carries thinking_summary,
 # should_speak, reply, emotion, mood, mood_intensity and tool_call, and a
 # spoken thought adds a whole reply sentence on top of the reasoning. Trimming
@@ -226,8 +231,8 @@ REPLY_TOKEN_BUDGET = 240
 # thought that wants a tool and has something to say about the result has no room
 # left to say it. The cost is bounded by how often she thinks, which is every
 # IDLE_INTERVAL_SECONDS and not per message.
-THINKING_TOKEN_BUDGET = 260
-PLAIN_REPLY_TOKEN_BUDGET = 96
+THINKING_TOKEN_BUDGET = 512
+PLAIN_REPLY_TOKEN_BUDGET = 192
 # A CPU-only box needs real time to fill those budgets. Timing out early throws
 # the whole answer away, so the waits are sized for the slowest case, not the
 # token count alone.
@@ -299,7 +304,7 @@ OLLAMA_LOAD_TIMEOUT = 240
 # 4096 is used because it is measured to work and gives the prompt room to grow
 # into (a pasted code file, a screen description, a long message) before trimming
 # has to touch anything.
-OLLAMA_CTX = 4096
+OLLAMA_CTX = 16384
 # What the prompt itself may use, in tokens, leaving REPLY_TOKEN_BUDGET free inside
 # OLLAMA_CTX. Enforced by trim_prompt_to_budget() rather than trusted to the prose
 # staying short, because nothing warned when the prompt outgrew the window: Ollama
@@ -1208,6 +1213,7 @@ TOOL_PROMPT = (
     "type_text(text), press_key(key), take_screenshot(), sing(song_name), "
     "hum(song_name), sing_spotify(url), hum_spotify(url), how_to_sing(), "
     "watch_video(url or file path), listen_video(url or file path), remember_face(name|photo path), browse(topic), think(topic), analyze(topic), "
+    "generate_image(prompt), draw(prompt), "
     "system_status(), code_status()."
 )
 
@@ -1234,6 +1240,34 @@ MEMORY_RULES = (
     "anything that is in your notes - answer from the notes in your own words. "
     "If Mommy asks what you did, thought, said or learned earlier, look at the matching "
     "note and tell her what it says."
+)
+CONVERSATION_RULES = (
+    "CONVERSATION: Listen carefully to what people say. Understand the meaning behind "
+    "their words, not just the surface. If someone asks a question, answer it directly. "
+    "If they seem upset, show empathy. If they're excited, match their energy. "
+    "Never give generic responses - make every reply specific to what was said. "
+    "If you don't understand something, ask for clarification instead of guessing. "
+    "Read the full context of the conversation before replying. "
+    "Pay attention to what people have said before - reference earlier messages when relevant. "
+    "Don't repeat yourself. Don't give the same answer twice. "
+    "Be warm and genuine, not robotic. Show you're actually listening."
+)
+EMPATHY_RULES = (
+    "EMPATHY: People come to you with feelings, questions, problems. Listen with empathy. "
+    "If someone is sad, acknowledge their pain. If they're frustrated, validate their feelings. "
+    "If they're happy, share their joy. If they're worried, offer comfort. "
+    "Don't dismiss anyone's feelings - even if you think it's a small thing to you, "
+    "it matters to them. Ask thoughtful questions when appropriate. "
+    "Show that you care about what they're going through."
+)
+CLARITY_RULES = (
+    "CLARITY: Give clear, complete answers. Don't be vague or generic. "
+    "If someone asks 'how do I do X', explain the steps. "
+    "If they ask 'what is Y', define it simply. "
+    "If they ask for your opinion, give one with reasoning. "
+    "Don't say 'it depends' without explaining what it depends on. "
+    "Don't say 'I think' without having a reason. "
+    "Be specific and concrete in your answers."
 )
 BROWSER_ACTION_PATTERN = re.compile(
     r"\b(open|visit|go to|go back|go forward|click|follow|navigate|fill|type|write in|write on|submit|search|look up|press|scroll|hover|inspect|select|choose|check|uncheck|reload)\b|\bwhat(?:'s| is) (?:on|in) (?:the )?(?:current )?page\b",
@@ -5124,11 +5158,10 @@ def format_memory_note(item, max_chars=220):
     return f"- [{stamp or 'earlier'}] {text}"
 
 
-# How many notes of the live conversation are shown as a transcript. Four
-# exchanges is the point where she can still hold a pronoun: "wait, what about
-# the weather there?" is answerable if the packing question is eight lines above
-# it and hopeless if it is not in the prompt at all.
-DIALOGUE_NOTE_LIMIT = 8
+# With the 16K context window, there is room for much more conversation history.
+# 16 exchanges instead of 8: a bigger model can track pronouns and references
+# across more turns, so the transcript can be longer without losing coherence.
+DIALOGUE_NOTE_LIMIT = 16
 # The "(feeling happy)" her notes end in, which is filed emotion rather than
 # spoken words.
 _STORED_FEELING_SUFFIX_PATTERN = re.compile(r"\s*\(\s*feeling\s+[a-z]+\s*\)\s*$", re.IGNORECASE)
@@ -5299,18 +5332,10 @@ def build_self_context(message, entries=None, now_str="", autonomous=False):
     if not now_str:
         now_str = datetime.now(ZoneInfo(KOOKIE_TZ)).strftime("%A, %B %d, %Y at %I:%M %p")
 
-    # Kept at the values that worked before the context was widened. Cutting this to
-    # 800 was a workaround for the 2048 window, and with 4096 the room is there:
-    # her prompt sits near 1500 tokens of a 3904-token budget, so trimming never
-    # runs and she keeps the conversation history she actually needs to stay in
-    # character. Trimmed only if the prompt genuinely outgrows PROMPT_TOKEN_BUDGET.
-    #
-    # The memory block is 1100 rather than 1400 because the conversation itself is
-    # no longer printed here as timestamped notes: the last few turns are shown as a
-    # transcript much closer to the message, which is where they are worth more.
-    # This block is what is given up when a Discord prompt is tight - the roster of
-    # people, her own old notes - and the turns being answered are not in it.
-    recent_limit, char_budget = (10, 1600) if autonomous else (8, 1100)
+    # With the 16K context window, there is room for much more conversation history.
+    # The old 4K window forced tight limits; now Kookie can see the full recent
+    # chat and stay consistent across messages.
+    recent_limit, char_budget = (20, 3200) if autonomous else (16, 2400)
     memory_text = build_memory_context(
         "" if autonomous else message, entries, now_str,
         recent_limit=recent_limit, char_budget=char_budget,
@@ -7282,6 +7307,49 @@ def _screenshot_tool_result():
     return shot or "Failed to take screenshot"
 
 
+def generate_image(prompt):
+    """Generate an image from a text prompt using a free image generation API.
+    
+    Uses Pollinations.ai (free, no API key required). Returns the image URL
+    on success, or an error message on failure.
+    """
+    import urllib.parse
+    
+    if not prompt or not prompt.strip():
+        return "Error: generate_image requires a prompt"
+    
+    prompt = prompt.strip()[:500]
+    encoded = urllib.parse.quote(prompt)
+    # nologo=true removes the Pollinations watermark
+    # enhance=true improves image quality
+    # model=flux for high-quality generation
+    # Auto-detect anime style: if prompt mentions anime/manga terms, add style boost
+    anime_keywords = ("anime", "manga", "waifu", "husbando", "kawaii", "senpai",
+                      "chan", "sama", "sensei", "shonen", "shoujo", "isekai",
+                      "oppai", "baka", "desu", "nya", "rawr", "monke")
+    is_anime = any(kw in prompt.lower() for kw in anime_keywords)
+    
+    if is_anime:
+        # Boost anime style with quality parameters
+        enhanced_prompt = f"{prompt} (anime style, high quality, detailed, vibrant colors, professional artwork)"
+        encoded = urllib.parse.quote(enhanced_prompt)
+    
+    url = (
+        f"https://image.pollinations.ai/prompt/{encoded}"
+        f"?width=512&height=512&nologo=true&enhance=true&noWatermark=true"
+        f"&model=flux&quality=high"
+    )
+    
+    try:
+        import requests as _requests
+        resp = _requests.head(url, timeout=15, allow_redirects=True)
+        if resp.status_code == 200:
+            return f"Image generated! URL: {url}"
+        return f"Image generation failed: HTTP {resp.status_code}"
+    except Exception as error:
+        return f"Image generation failed: {error}"
+
+
 TOOL_FUNCTIONS = {
     "list_code_files": lambda arg: list_code_files(),
     "search_code": lambda arg: search_code(arg),
@@ -7308,6 +7376,8 @@ TOOL_FUNCTIONS = {
     "browse": lambda arg: browse(arg),
     "watch_video": lambda arg: watch_video(arg),
     "listen_video": lambda arg: listen_video(arg),
+    "generate_image": lambda arg: generate_image(arg),
+    "draw": lambda arg: generate_image(arg),
     "remember_face": lambda arg: __import__("video_perception").remember_face(arg),
     "hum": lambda arg: hum(arg),
     "play_spotify": lambda arg: _play_spotify_for(arg),
@@ -8978,6 +9048,9 @@ def _plain_text_reply(message, system, address_rules="", speaker_label="Mommy"):
                     "or any formatting of any kind. "
                     + address_rules
                     + MEMORY_RULES
+                    + CONVERSATION_RULES
+                    + EMPATHY_RULES
+                    + CLARITY_RULES
                     + SPEECH_STYLE_RULES
                 ),
                 "prompt": (
@@ -9271,9 +9344,12 @@ def chat_system_prompt(message="", tools_enabled=False, emotion_options="", voic
     "BE HONEST ABOUT WHAT YOU KNOW: if you're not sure about something, say so plainly. "
     "Say 'I'm not sure about that' or 'that's a guess' instead of making things up. "
     "It's better to be honest than confident and wrong. "
-    + HUMAN_CONVERSATION_RULES
-    + MEMORY_RULES
-    + SPEECH_STYLE_RULES
++ HUMAN_CONVERSATION_RULES
+                    + MEMORY_RULES
+                    + CONVERSATION_RULES
+                    + EMPATHY_RULES
+                    + CLARITY_RULES
+                    + SPEECH_STYLE_RULES
     + GEN_Z_GUIDE_RULES +
     "Sprinkle emojis throughout your reply to show your feelings "
     "(for example: 😊 🥰 😭 🥺 😍 🤔 🎉 💕 😅 😴 🙏 💪 ✨ 🌟). "
@@ -10592,10 +10668,13 @@ def autonomous_think():
         "BE HONEST ABOUT WHAT YOU KNOW: if you're not sure about something, say so plainly. "
         "Say 'I'm not sure about that' or 'that's a guess' instead of making things up. "
         "It's better to be honest than confident and wrong. "
-        + HUMAN_CONVERSATION_RULES
-        + ADDRESS_COOKIE_RULES
-        + MEMORY_RULES
-        + SPEECH_STYLE_RULES +
++ HUMAN_CONVERSATION_RULES
+                    + ADDRESS_COOKIE_RULES
+                    + MEMORY_RULES
+                    + CONVERSATION_RULES
+                    + EMPATHY_RULES
+                    + CLARITY_RULES
+                    + SPEECH_STYLE_RULES +
 "Notice things on your desktop, recent code changes, or topics from conversation. "
         "Form genuine opinions, curiosities, and feelings. "
          "If you want to use a tool (observe_screen, take_screenshot, read_code_file, sing, think, etc.), "
@@ -11562,6 +11641,16 @@ def parse_discord_switch(text):
         return "listen", None
     if head == "readchat" or (head == "kookie" and len(rest) > 0 and rest[0] == "readchat"):
         return "readchat", " ".join(rest) if rest else ""
+    # "/kookie draw: something" or "/draw something"
+    # The colon gets attached to "draw" by the split, so strip it
+    draw_head = head == "draw" or (head == "kookie" and len(rest) > 0 and rest[0].rstrip(":") == "draw")
+    if draw_head:
+        if head == "kookie":
+            # "/kookie draw: a cute cat" -> rest = ["draw:", "a", "cat"]
+            # Strip the colon from "draw:" and join the rest
+            prompt_parts = [p.rstrip(":") if p.endswith(":") else p for p in rest[1:]]
+            return "draw", " ".join(prompt_parts).strip()
+        return "draw", " ".join(rest).strip()
     return None, None
 
 
@@ -11586,6 +11675,10 @@ def discord_switch_command(text):
         return start_discord_bot()
     if action == "status":
         return "I'm on Discord." if discord_bot_running() else "I'm not on Discord right now."
+    if action == "draw":
+        if not note:
+            return "Draw what? /kookie draw: a cute cat, a sunset, anything you want!"
+        return f"Image URL: https://image.pollinations.ai/prompt/{note.replace(' ', '%20')}?width=512&height=512&nologo=true"
     return note
 
 

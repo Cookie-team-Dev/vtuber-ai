@@ -32,6 +32,7 @@ import tempfile
 import threading
 import time
 import urllib.request
+import urllib.parse
 
 # Patch discord.ext.voice_recv.reader.AudioReader.stop so a self-stop - which
 # is what the voice_recv router does when its reader finishes - does not get
@@ -1163,6 +1164,19 @@ async def _speak_into(channel, text, speak=True):
     """
     if not text or not text.strip():
         return None
+    
+    # Check if the reply contains an image URL and send it
+    import re as _re
+    image_match = _re.search(r'https?://[^\s]+\.(?:png|jpg|jpeg|gif|webp)(?:\?[^\s]*)?', text, _re.IGNORECASE)
+    if image_match:
+        image_url = image_match.group(0)
+        caption = text.replace(image_url, "").strip()
+        result, error = await _send_image(channel, image_url, caption)
+        if result is not None:
+            _record_her_send(result)
+            return result
+        # Fall through to text send if image fails
+    
     name = channel_name_of_channel(channel)
     if _she_already_said_that(text, name):
         print(f"Discord bot: not sending the same sentence twice in #{name}")
@@ -1258,6 +1272,33 @@ async def _send_dm(channel_like, text):
             return None, f"Discord refused it ({second.status})"
     except discord.HTTPException as error:
         return None, f"Discord refused it ({error.status})"
+
+
+async def _send_image(channel_like, image_url, caption=""):
+    """Download an image from a URL and send it to Discord."""
+    import io
+    import requests as _requests
+    
+    try:
+        resp = _requests.get(image_url, timeout=30, headers={"User-Agent": "KookieAi/1.0"})
+        if resp.status_code != 200:
+            return None, f"Could not download image: HTTP {resp.status_code}"
+        
+        # Check it's actually an image
+        content_type = resp.headers.get("content-type", "")
+        if not content_type.startswith("image/"):
+            return None, f"URL did not return an image: {content_type}"
+        
+        # Discord has a 25MB limit for free accounts, 8MB for most
+        if len(resp.content) > 8 * 1024 * 1024:
+            return None, "Image is too large for Discord (>8MB)"
+        
+        file = discord.File(io.BytesIO(resp.content), filename="kookie_image.png")
+        if caption:
+            return await channel_like.send(caption, file=file), None
+        return await channel_like.send(file=file), None
+    except Exception as error:
+        return None, f"Could not send image: {error}"
 
 
 def _compose_dm_blocking(target_name, speaker_name, topic=""):
@@ -1437,6 +1478,78 @@ async def _handle_message(message):
         # An attachment or an emoji-only message. She has seen it and it counts
         # as the room being alive, but there are no words to answer.
         return
+# "/kookie draw: something" or "/draw something" - generate an image
+    # Handled here, before the "not addressed" check, so a bare /draw works
+    # without needing to ping her first.
+    raw_text = verdict.get("text") or ""
+    draw_match = re.match(r"^(?:/kookie\s+draw|/draw)[:\s]+(.+)$", raw_text, re.IGNORECASE)
+    if draw_match:
+        prompt = draw_match.group(1).strip()
+        if prompt:
+            print(f"Discord bot: {label} asked Kookie to draw: {prompt[:80]}")
+            await message.channel.send(f"🎨 Drawing: {prompt}...")
+            
+            # Check for "character from show" format
+            from_match = re.search(r"(.+?)\s+from\s+(.+)$", prompt, re.IGNORECASE)
+            if from_match:
+                char_name = from_match.group(1).strip()
+                show_name = from_match.group(2).strip()
+                prompt = f"{char_name} from {show_name}, anime character design, official art style, high quality, detailed, vibrant colors, professional artwork"
+            
+            # Auto-detect anime style
+            anime_keywords = ("anime", "manga", "waifu", "husbando", "kawaii", "senpai",
+                            "chan", "sama", "sensei", "shonen", "shoujo", "isekai",
+                            "oppai", "baka", "desu", "nya", "rawr", "monke",
+                            "naruto", "one piece", "dragon ball", "attack on titan",
+                            "demon slayer", "jujutsu kaisen", "my hero academia",
+                            "re zero", "re:zero", "sword art online", "sao",
+                            "fate", "fate/stay", "fate grand order", "fgo",
+                            "pokemon", "spy x family", "chainsaw man",
+                            "bleach", "gintama", "hunter x hunter", "hxh",
+                            "fullmetal alchemist", "fma", "code geass",
+                            "steins;gate", "cowboy bebop", "neon genesis evangelion",
+                            "evangelion", "one punch man", "opm", "mob psycho 100",
+                            "tokyo ghoul", "parasyte", "death note",
+                            "soul eater", "black butler", "kuroshitsuji",
+                            "noragami", "blue exorcist", "ao no exorcist",
+                            "magi", "akame ga kill", "kill la kill",
+                            "gurren lagann", "durarara",
+                            "baccano", "monogatari", "kara no kyoukai",
+                            "overlord", "that time i got reincarnated as a slime",
+                            "tensei shitara slime datta ken", "slime",
+                            "mushoku tensei", "jobless reincarnation",
+                            "the rising of the shield hero", "tate no Yuusha",
+                            "konosuba", "kono subarashii",
+                            "reincarnated as a sword",
+                            "tensei shitara ken deshita", "blade",
+                            "the wrong way to use healing magic",
+                            "healing magic no wrong use",
+                            "solo leveling", "omniscient reader",
+                            "orv", "tbate", "trash of the count's family",
+                            "tcf", "lcf", "lout of count's family",
+                            "survival story in a fantasy world",
+                            "apothecary diary", "kusuriya no hitorigoto",
+                            "honey lemon soda", "honey and lemon",
+                            "the apothecary diaries")
+            
+            is_anime = any(kw in prompt.lower() for kw in anime_keywords)
+            
+            if is_anime and not from_match:
+                enhanced = f"{prompt} (anime style, high quality, detailed, vibrant colors, professional artwork, character design, official art)"
+                prompt = enhanced
+            
+            image_url = (
+                f"https://image.pollinations.ai/prompt/"
+                f"{urllib.parse.quote(prompt)}"
+                f"?width=512&height=512&nologo=true&enhance=true&noWatermark=true"
+                f"&model=flux&quality=high"
+            )
+            sent, error = await _send_image(message.channel, image_url, f"Here's what I drew: {prompt[:80]}")
+            if sent is not None:
+                print(f"Discord bot: sent image for '{prompt[:40]}...'")
+            else:
+                await message.channel.send(f"Sorry, I couldn't draw that: {error}")
+            return
     # She is not being spoken to. It is in the room now and in the thought that
     # runs next; answering it here would spend a minute of the model on a message
     # nobody asked her about, and the queue would back up behind it.

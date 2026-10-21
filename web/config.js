@@ -1,2 +1,3 @@
 // Kookie Web Configuration
-window.KOOKIE_API_BASE = 'https://monitor-crossword-traveler-particularly.trycloudflare.com';
+// Backend API URL - Railway deployment
+window.KOOKIE_API_BASE = 'https://web-production-c82cb.up.railway.app';
