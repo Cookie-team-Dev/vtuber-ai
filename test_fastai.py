@@ -1,6 +1,6 @@
 import fastai as f
 
-tools = [{'type': 'function', 'function': {'name': 'browse', 'parameters': {'type': 'object', 'properties': {'query': {'type': 'string'}}}}]
+tools = [{'type': 'function', 'function': {'name': 'browse', 'parameters': {'type': 'object', 'properties': {'query': {'type': 'string'}}}}}]
 try:
     result = f.chat(
         [{'role': 'user', 'content': 'search for python'}],

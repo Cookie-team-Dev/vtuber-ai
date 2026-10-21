@@ -59,6 +59,7 @@ web/web_keys.json
 
 # Kookie launcher state
 .kookie.pid
+kookie_discord.pid
 .kookie_probe
 # Left behind only if a memory compaction was killed mid-write
 memory_journal.log.compacting
