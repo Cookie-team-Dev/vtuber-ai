@@ -40,13 +40,27 @@ import urllib.parse
 # is what the voice_recv router does when its reader finishes - does not get
 # mistaken for the client dying. The original behaviour is kept; only the
 # noisy traceback that used to print on every stop is gone.
-import fastai
 import discord.ext.voice_recv.reader as reader_mod
 
 _original_stop = reader_mod.AudioReader.stop
 
 def _patched_stop(self):
-    return _original_stop(self)
+    """Stop the reader the way the library does, but without the noise.
+
+    The library logs an already-stopped reader with exc_info=True, which
+    prints a traceback for something that was never an error, and the router
+    stops a reader that has already finished on every disconnect. The real
+    stop still happens; only the traceback is dropped, and anything that
+    does go wrong is logged at debug level instead of escaping into the
+    voice router.
+    """
+    try:
+        if not getattr(self, "active", False):
+            return None
+        return _original_stop(self)
+    except Exception as error:
+        logging.getLogger(__name__).debug("AudioReader.stop failed: %s", error)
+        return None
 
 reader_mod.AudioReader.stop = _patched_stop
 print("[VOICE] Patched AudioReader.stop")
@@ -54,6 +68,22 @@ print("[VOICE] Patched AudioReader.stop")
 # Voice channel state: one VoiceClient per guild, plus a flag for whether her
 # replies should be spoken aloud in that guild's voice channel.
 _VOICE_CLIENTS = {}
+
+# The names she answers to when somebody says them out loud. Compiled once,
+# because it is matched against every phrase that comes over the microphone.
+_HER_VOICE_NAME = re.compile(
+    r"(?<![a-z])(?:kookie|kuki|cookie|kook)(?![a-z])",
+    re.IGNORECASE,
+)
+
+# The background tasks that keep a voice listener alive, keyed by guild id.
+#
+# Kept apart from _VOICE_LISTENERS, which is the shared "a sink is installed
+# in this guild" flag that discord_commands owns and reads as a plain truth
+# value. A task object is truthy, so putting one in there would make the
+# listener believe it was already running and never install its sink at all.
+# The flag and the task that owns it are two different things.
+_VOICE_LISTEN_TASKS = {}
 
 class _VoiceEnabledSet(set):
     def add(self, value):
@@ -92,7 +122,6 @@ from discord_commands import (
     maybe_switch,
     register_slash_commands,
     voice_listen,
-    voice_speak,
 )
 from discord_commands import _VOICE_LISTENERS, _VOICE_SINKS
 
@@ -320,6 +349,46 @@ ANIME_STYLE_TERMS = (
     "the apothecary diaries"
 )
 
+def _voice_listener_done(guild_id, task):
+    """Drop a finished voice listener and say why it ended, if it failed."""
+    if _VOICE_LISTEN_TASKS.get(guild_id) is task:
+        _VOICE_LISTEN_TASKS.pop(guild_id, None)
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is not None:
+        print(f"Discord bot: voice listener for guild {guild_id} failed: {error}")
+
+
+def _start_voice_listener(guild_id, channel, on_speech):
+    """Run the voice listener for a guild in the background.
+
+    voice_listen owns a sink and a watchdog for as long as the guild stays
+    connected, so awaiting it pinned the message handler that started it and
+    the bot stopped reacting to anything at all while the microphone was
+    open. It runs as a task instead, the task is kept so it can be cancelled
+    when she leaves the channel, and a done callback drops it again once it
+    ends.
+    """
+    existing = _VOICE_LISTEN_TASKS.get(guild_id)
+    if existing is not None and not existing.done():
+        return existing
+    task = asyncio.create_task(voice_listen(channel, on_speech))
+    _VOICE_LISTEN_TASKS[guild_id] = task
+    task.add_done_callback(
+        lambda finished, gid=guild_id: _voice_listener_done(gid, finished)
+    )
+    return task
+
+
+def _cancel_voice_listener(guild_id):
+    """Stop the background voice listener for a guild, if one is running."""
+    task = _VOICE_LISTEN_TASKS.pop(guild_id, None)
+    if task is None or task.done():
+        return
+    task.cancel()
+
+
 async def _voice_join(channel):
     """Join the voice channel the user is in, for the guild it belongs to."""
     guild_id = getattr(getattr(channel, "guild", None), "id", None)
@@ -334,6 +403,7 @@ async def _voice_join(channel):
         except Exception:
             pass
         del _VOICE_CLIENTS[guild_id]
+        _cancel_voice_listener(guild_id)
         _VOICE_LISTENERS.pop(guild_id, None)
         _VOICE_SINKS.pop(guild_id, None)
     try:
@@ -346,6 +416,7 @@ async def _voice_join(channel):
 
 async def _voice_leave(guild_id):
     """Disconnect from a guild's voice channel, if connected."""
+    _cancel_voice_listener(guild_id)
     client = _VOICE_CLIENTS.get(guild_id)
     if client is None:
         return
@@ -652,6 +723,27 @@ class TypingReply:
         self.message = None
 
 
+def _log_task_failure(task, what):
+    """Report what a finished background task died of, if anything."""
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is not None:
+        print(f"Discord bot: {what} failed: {type(error).__name__}: {error}")
+
+
+def _spawn(coro, what):
+    """Start a background task and make sure it cannot fail silently.
+
+    A task with nothing watching it reports its exception to nobody, which is
+    how a voice reply that died and a chat reader that gave up both looked
+    exactly like her having decided not to say anything.
+    """
+    task = asyncio.create_task(coro)
+    task.add_done_callback(lambda finished: _log_task_failure(finished, what))
+    return task
+
+
 async def think_and_reply(channel, label, text, user_id=None, burst_note=""):
     """Wait for her, looking busy, then put the answer in the channel."""
     started = time.monotonic()
@@ -749,7 +841,10 @@ async def think_and_reply(channel, label, text, user_id=None, burst_note=""):
                     from discord_commands import chat_reader_speak_message
                     bot_user_id = _client.user.id if _client and _client.user else None
                     print(f"[CHAT READER] streamer path: TRIGGERING chat_reader_speak_message for bot reply")
-                    asyncio.create_task(chat_reader_speak_message(guild_id, full_reply, _client.user.display_name if _client and _client.user else "Kookie", author_id=bot_user_id, bot_user_id=bot_user_id, text_channel_id=None))
+                    _spawn(
+                        chat_reader_speak_message(guild_id, full_reply, _client.user.display_name if _client and _client.user else "Kookie", author_id=bot_user_id, bot_user_id=bot_user_id, text_channel_id=None),
+                        "chat reader (own reply)",
+                    )
                 except Exception as e:
                     print(f"[CHAT READER] Error triggering for own message: {e}")
         return
@@ -902,6 +997,33 @@ async def drain_queue():
             queue.task_done()
 
 
+# The names she answers to. Built once and kept, because the check runs on
+# every message in every channel she can see and the tuple was rebuilt each
+# time. Her display name is only known once she has logged in, so it is
+# filled in the first time the check asks for it.
+_NAME_TOKENS = ()
+
+
+def _name_tokens():
+    """The words that count as her name, built once the client is connected."""
+    global _NAME_TOKENS
+    if _NAME_TOKENS:
+        return _NAME_TOKENS
+    user = getattr(_client, "user", None) if _client is not None else None
+    tokens = tuple(
+        token
+        for token in (
+            getattr(user, "display_name", None),
+            getattr(user, "name", None),
+            "kookie", "cookie",
+        )
+        if token and len(token) > 2
+    )
+    if tokens and user is not None:
+        _NAME_TOKENS = tokens
+    return tokens
+
+
 def classify(message):
     """Look at one message and decide what she should do with it.
 
@@ -997,13 +1119,7 @@ def classify(message):
     # same word - it is how people actually call her, and matching only the
     # display name left every "cookie hello" sitting in the room unanswered
     # while the bot waited for a word it was never going to hear.
-    _NAME_TOKENS = tuple(
-        token
-        for token in (
-            _client.user.display_name, _client.user.name, "kookie", "cookie",
-        )
-        if token and len(token) > 2
-    )
+    name_tokens = _name_tokens()
     # The question words are the ones that start a question. The forms of "to be"
     # are deliberately left out: "kookie is so cute" ends in one, and it is a
     # statement about her, not a question to her, so counting it made her reply
@@ -1014,7 +1130,7 @@ def classify(message):
         "should", "would", "will", "shall", "do", "does", "did", "are",
     )
     named = False
-    for token in _NAME_TOKENS:
+    for token in name_tokens:
         opening = (
             rf"\s*(?:{GREETING_OPENERS})\s+{re.escape(token)}\b"
             rf"|\s*{re.escape(token)}\b"
@@ -1079,7 +1195,7 @@ def classify(message):
     # model is never handed the raw "<@12345>" as part of the question.
     for token in mention_tokens:
         content = content.replace(token, " ")
-    for prefix in _NAME_TOKENS:
+    for prefix in name_tokens:
         # The same length rule as the name check above, and for the same reason:
         # a bot called "a" or "ok" would otherwise have that prefix cut off the
         # front of every single message it was ever sent.
@@ -1258,7 +1374,10 @@ async def _speak_into(channel, text, speak=True):
             try:
                 from discord_commands import chat_reader_speak_message
                 bot_user_id = _client.user.id if _client and _client.user else None
-                asyncio.create_task(chat_reader_speak_message(guild_id, text, _client.user.display_name if _client and _client.user else "Kookie", author_id=bot_user_id, bot_user_id=bot_user_id, text_channel_id=None))
+                _spawn(
+                    chat_reader_speak_message(guild_id, text, _client.user.display_name if _client and _client.user else "Kookie", author_id=bot_user_id, bot_user_id=bot_user_id, text_channel_id=None),
+                    "chat reader (own message)",
+                )
             except Exception as e:
                 print(f"[CHAT READER] Error triggering for own message: {e}")
         else:
@@ -1342,7 +1461,7 @@ async def _send_image(channel_like, image_url, caption=""):
     if not hostname:
         return None, "URL has no hostname"
     try:
-        infos = socket.getaddrinfo(hostname, None)
+        infos = await asyncio.to_thread(socket.getaddrinfo, hostname, None)
     except OSError as error:
         return None, f"Could not resolve {hostname}: {error}"
     cgnat_start = ipaddress.IPv4Address("100.64.0.0")
@@ -1358,7 +1477,10 @@ async def _send_image(channel_like, image_url, caption=""):
         if ip.version == 4 and cgnat_start <= ip <= cgnat_end:
             return None, f"URL resolves to {addr}, which is in the CGNAT range"
     try:
-        resp = _requests.get(image_url, timeout=30, headers={"User-Agent": "KookieAi/1.0"}, allow_redirects=False)
+        resp = await asyncio.to_thread(
+            _requests.get, image_url, timeout=30,
+            headers={"User-Agent": "KookieAi/1.0"}, allow_redirects=False,
+        )
         if resp.status_code != 200:
             return None, f"Could not download image: HTTP {resp.status_code}"
         
@@ -1516,7 +1638,7 @@ async def _handle_ready(client):
         import traceback
         traceback.print_exc()
     if _worker is None or _worker.done():
-        _worker = asyncio.ensure_future(drain_queue())
+        _worker = _spawn(drain_queue(), "message queue worker")
         print("Discord bot: drain_queue worker started")
     try:
         await _tree.sync()
@@ -1566,7 +1688,14 @@ async def _handle_message(message):
         prompt = draw_match.group(1).strip()
         if prompt:
             print(f"Discord bot: {label} asked Kookie to draw: {prompt[:80]}")
-            await message.channel.send(f"🎨 Drawing: {prompt}...", allowed_mentions=NO_PINGS)
+            try:
+                await message.channel.send(f"🎨 Drawing: {prompt}...", allowed_mentions=NO_PINGS)
+            except discord.HTTPException as error:
+                # No permission, or the channel is gone. There is no point
+                # drawing a picture nobody is allowed to see either, so the
+                # whole request stops here instead of failing later.
+                print(f"Discord bot: could not post the drawing notice: {error}")
+                return
             
             # Build the best possible prompt for character accuracy
             enhanced_prompt = prompt
@@ -1596,7 +1725,19 @@ async def _handle_message(message):
             # every series in existence, so a keyword list is the fallback
             # rather than the rule - and when the fast model is offline the
             # keyword list still catches the obvious ones.
-            llm_anime = await asyncio.to_thread(fastai.is_anime_prompt, prompt)
+            # The fast model is asked whether this is an anime request, but it
+            # is not a hard dependency: without it - or when it is offline or
+            # throws - the keyword list above still catches the obvious ones.
+            llm_anime = None
+            try:
+                import fastai
+            except Exception as error:
+                print(f"Discord bot: fastai is not available ({error}); using the keyword list")
+            else:
+                try:
+                    llm_anime = await asyncio.to_thread(fastai.is_anime_prompt, prompt)
+                except Exception as error:
+                    print(f"Discord bot: the anime check failed ({error}); using the keyword list")
             if llm_anime is True:
                 is_anime = True
             elif llm_anime is False:
@@ -1686,11 +1827,6 @@ async def _handle_message(message):
             if guild_id in get_voice_enabled():
                 voice_client = _VOICE_CLIENTS.get(guild_id)
                 if voice_client is not None and voice_client.is_connected():
-                    _HER_VOICE_NAME = re.compile(
-                        r"(?<![a-z])(?:kookie|kuki|cookie|kook)(?![a-z])",
-                        re.IGNORECASE,
-                    )
-
                     async def _on_speech(user, text):
                         name = getattr(user, "display_name", None) or str(user.id)
                         vc = _VOICE_CLIENTS.get(guild_id)
@@ -1714,14 +1850,14 @@ async def _handle_message(message):
                             if vc is None or not vc.is_connected():
                                 return
                             target_channel = getattr(vc, "channel", None) or author.voice.channel
-                            await voice_speak(target_channel, text)
+                            await _voice_speak(target_channel, text)
                         except Exception as e:
                             print("Discord bot: voice reply error:", e)
-                    listen_task = asyncio.create_task(voice_listen(author.voice.channel, _on_speech))
-                    try:
-                        await listen_task
-                    except Exception as e:
-                        print(f"Discord bot: voice_listen error for auto-join guild={guild_id}: {e}")
+                    # The listener is a long-running audio loop, so it is
+                    # started as a background task and left there: awaiting it
+                    # pinned this handler, and with it the whole message
+                    # queue, for as long as the microphone was open.
+                    _start_voice_listener(guild_id, author.voice.channel, _on_speech)
     # Chat reader: if enabled for this channel and we're in voice, read the message aloud
     # In "self" mode, we read Kookie's own replies; in "all" mode, we read all messages; in "others" mode, we read only other users' messages
     if text and not verdict.get("silent"):
@@ -1734,11 +1870,17 @@ async def _handle_message(message):
                 # "all" mode: read all messages from users
                 if mode == "all" and not is_kookie:
                     print(f"[CHAT READER] TRIGGERING for user message (mode=all)")
-                    asyncio.create_task(chat_reader_speak_message(guild_id, text, label, text_channel_id=message.channel.id))
+                    _spawn(
+                        chat_reader_speak_message(guild_id, text, label, text_channel_id=message.channel.id),
+                        "chat reader (all)",
+                    )
                 # "others" mode: read only other users' messages (not Kookie's)
                 elif mode == "others" and not is_kookie:
                     print(f"[CHAT READER] TRIGGERING for user message (mode=others)")
-                    asyncio.create_task(chat_reader_speak_message(guild_id, text, label, text_channel_id=message.channel.id))
+                    _spawn(
+                        chat_reader_speak_message(guild_id, text, label, text_channel_id=message.channel.id),
+                        "chat reader (others)",
+                    )
                 # "self" mode is handled in _speak_into for Kookie's replies
         except Exception as e:
             print(f"[CHAT READER] Error: {e}")
@@ -1992,26 +2134,25 @@ def main():
     _client.event(on_message)
     _client.event(on_message_edit)
 
-    # The headless half of startup: memory, knowledge and the model, with no
-    # avatar and no animation loop, because there is no window to animate.
-    # controller.start_runtime(connect_avatar=False, animate_parameters=False)
-
     if not _take_over_from_other_bots():
         return 1
 
+    # The headless half of startup: memory, knowledge and the model, with no
+    # avatar and no animation loop, because there is no window to animate.
+    #
+    # It is a blocking call - it loads her knowledge base, the facts she
+    # learned, her memory and her notes, and warms the prompt cache - so it
+    # runs before the event loop exists. Left out, she answers with a cold
+    # model and an empty head: no knowledge, no learned facts, no memory.
+    try:
+        controller.start_runtime(connect_avatar=False, animate_parameters=False)
+    except Exception as error:
+        # A runtime that did not come up cleanly is still worth being online
+        # for: she is slow and forgetful, but she answers.
+        print(f"Discord bot: start_runtime did not finish cleanly: {error}")
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-
-    # Ignore SIGTERM during startup to prevent premature shutdown
-    import signal
-    
-    def signal_handler(signum, frame):
-        print(f"[BOT] Received signal {signum}")
-        import traceback
-        traceback.print_stack(frame)
-    
-    signal.signal(signal.SIGTERM, signal_handler)
-    signal.signal(signal.SIGINT, signal_handler)
 
     # def handle_exception(loop, context):
     #     msg = context.get("exception", context["message"])
