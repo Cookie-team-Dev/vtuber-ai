@@ -5,3 +5,4 @@ numpy
 playwright
 discord.py
 sympy
+pyfiglet

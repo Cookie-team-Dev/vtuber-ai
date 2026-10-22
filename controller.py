@@ -1217,6 +1217,9 @@ TOOL_PROMPT = (
     "type_text(text), press_key(key), take_screenshot(), sing(song_name), "
     "hum(song_name), sing_spotify(url), hum_spotify(url), how_to_sing(), "
     "watch_video(url or file path), listen_video(url or file path), remember_face(name|photo path), browse(topic), http_request(url), weather(city), news(topic), stock_price(symbol), think(topic), analyze(topic), "
+    "crypto_price(cryptocurrency), sports_scores(sport), dice(sides), coin_flip(), "
+    "random_number(min|max), lottery_numbers(count|max), ascii_art(text), "
+    "text_to_ascii(text), morse_code(text), barcode(text), "
     "generate_image(prompt), draw(prompt), "
     "set_reminder(text|minutes), list_reminders(), convert_units(value|from|to), "
     "calculate_distance(lat1|lon1|lat2|lon2), time_between(iso1|iso2), "
@@ -1229,7 +1232,16 @@ TOOL_PROMPT = (
     "crop_image(url or path|x1|y1|x2|y2), convert_image(url or path|format), "
     "encode_base64(text), decode_base64(text), hash_text(text|algorithm), "
     "uuid(), timestamp(), "
-    "run_command(cmd), list_files(path|pattern), read_file(path|start|num), delete_file(path), copy_file(src|dst)."
+    "run_command(cmd), list_files(path|pattern), read_file(path|start|num), delete_file(path), copy_file(src|dst), dns_lookup(domain), ping(host|count), traceroute(host), port_check(host|port), my_ip(), network_speed(), "
+    "generate_password(length|symbols), password_strength(password), word_search(text|word), text_stats(text), format_number(number|decimals), read_doc(path), "
+    "add_event(date|time|title), list_events(date), countdown(date|description), "
+    "sleep_timer(minutes), generate_tone(frequency|duration), "
+    "generate_scale(root|octave|scale), note_to_frequency(note), "
+    "frequency_to_note(hz), "
+    "create_archive(archive_type|files|output), extract_archive(archive|output_dir), list_archive(archive), "
+    "read_pdf(file), pdf_to_text(file|output), image_to_pdf(img1,img2|output), "
+    "apply_filter(image|filter), add_text_to_image(image|text|output), "
+    "rotate_image(image|degrees|output), thumbnail_image(image|max_size|output), "
 )
 
 GEN_Z_GUIDE_RULES = (
@@ -8879,6 +8891,1597 @@ def set_brightness(level):
 
 
 
+def dns_lookup(domain):
+    import socket
+    try:
+        results = socket.getaddrinfo(domain, None)
+        ips = sorted(set(r[4][0] for r in results))
+        return f"{domain} resolves to: " + ", ".join(ips)
+    except Exception as e:
+        return f"DNS lookup failed: {e}"
+
+
+def ping(host, count=4):
+    import re
+    if not re.match(r'^[a-zA-Z0-9.\-]+$', str(host)):
+        return "Error: invalid hostname"
+    try:
+        return run_command(f"ping -c {int(count)} {host}")
+    except Exception as e:
+        return f"Ping failed: {e}"
+
+
+def traceroute(host):
+    import re
+    if not re.match(r'^[a-zA-Z0-9.\-]+$', str(host)):
+        return "Error: invalid hostname"
+    try:
+        return run_command(f"traceroute {host}")
+    except Exception as e:
+        return f"Traceroute failed: {e}"
+
+
+def port_check(host, port):
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(3)
+        result = s.connect_ex((str(host), int(port)))
+        s.close()
+        return f"{host}:{port} is {'OPEN' if result == 0 else 'CLOSED/FILTERED'}"
+    except Exception as e:
+        return f"Port check failed: {e}"
+
+
+def my_ip():
+    try:
+        result = http_request("https://ifconfig.me")
+        if "HTTP" not in result:
+            return f"Public IP: {result.strip()}"
+        return "Could not determine public IP"
+    except Exception:
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+        except Exception:
+            ip = "unknown"
+        finally:
+            s.close()
+        return f"Local IP: {ip} (public IP lookup failed)"
+
+
+def network_speed():
+    try:
+        import time
+        start = time.time()
+        result = http_request("https://httpbin.org/bytes/1048576")
+        elapsed = time.time() - start
+        if elapsed > 0:
+            mbps = (1.0 / elapsed) * 8
+            return f"Download speed: {mbps:.1f} Mbps (1MB in {elapsed:.2f}s)"
+        return "Speed test failed: too fast to measure"
+    except Exception as e:
+        return f"Speed test failed: {e}"
+
+
+
+# --- document / text utility tools (added 2026-10-22) -------------------
+def generate_password(length=24, include_symbols=True):
+    """Generate a cryptographically secure random password."""
+    import secrets
+    import string
+    try:
+        length = max(4, min(128, int(length)))
+        alphabet = string.ascii_letters + string.digits
+        if include_symbols:
+            alphabet += string.punctuation
+        password = "".join(secrets.choice(alphabet) for _ in range(length))
+        return password
+    except Exception as e:
+        return f"Password generation failed: {e}"
+
+
+def password_strength(password):
+    """Rate a password's strength and offer suggestions."""
+    import re
+    try:
+        score = 0
+        feedback = []
+        if len(password) >= 8:
+            score += 1
+        else:
+            feedback.append("too short (min 8 chars)")
+        if len(password) >= 16:
+            score += 1
+        if re.search(r"[a-z]", password):
+            score += 1
+        else:
+            feedback.append("no lowercase letters")
+        if re.search(r"[A-Z]", password):
+            score += 1
+        else:
+            feedback.append("no uppercase letters")
+        if re.search(r"[0-9]", password):
+            score += 1
+        else:
+            feedback.append("no numbers")
+        if re.search(r"[^a-zA-Z0-9]", password):
+            score += 1
+        else:
+            feedback.append("no symbols")
+        labels = ["Very Weak", "Weak", "Fair", "Good", "Strong", "Excellent"]
+        rating = labels[min(score, len(labels) - 1)]
+        result = f"Strength: {rating} (score: {score}/6)"
+        if feedback:
+            result += "\nSuggestions: " + "; ".join(feedback)
+        return result
+    except Exception as e:
+        return f"Password strength check failed: {e}"
+
+
+def word_search(text, word):
+    """Count occurrences of a word (case-insensitive, whole word)."""
+    import re
+    try:
+        if not text or not word:
+            return "Error: word_search requires text and word"
+        matches = list(re.finditer(r"\b" + re.escape(word) + r"\b", text, re.IGNORECASE))
+        if not matches:
+            return f"Word '{word}' not found in text"
+        positions = [m.start() for m in matches]
+        return f"Found '{word}' {len(matches)} time(s) at positions: {positions}"
+    except Exception as e:
+        return f"Word search failed: {e}"
+
+
+def text_stats(text):
+    """Return detailed text statistics."""
+    import re
+    from collections import Counter
+    try:
+        if not text:
+            return "Error: text_stats requires text"
+        words = text.split()
+        sentences = [s.strip() for s in re.split(r"[.!?]+", text) if s.strip()]
+        paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+        word_freq = Counter(w.lower().strip(".,!?;:\"'()[]{}") for w in words)
+        most_common = word_freq.most_common(5)
+        reading_time = max(1, len(words) // 200)
+        result = (
+            f"Words: {len(words)}\n"
+            f"Sentences: {len(sentences)}\n"
+            f"Paragraphs: {len(paragraphs)}\n"
+            f"Reading time: ~{reading_time} min\n"
+            "Most common words:\n"
+        )
+        for w, c in most_common:
+            result += f"  {w}: {c}\n"
+        return result.strip()
+    except Exception as e:
+        return f"Text stats failed: {e}"
+
+
+def format_number(number, decimals=2):
+    """Format a number with thousand separators and fixed decimals."""
+    try:
+        num = float(number)
+        d = int(decimals)
+        return f"{num:,.{d}f}"
+    except Exception as e:
+        return f"Format number failed: {e}"
+
+
+def read_doc(file_path):
+    """Read a document file (.txt, .md, .csv, .json, .yaml, .toml)."""
+    try:
+        return read_file(file_path)
+    except Exception as e:
+        return f"Read doc failed: {e}"
+
+
+# -----------------------------
+# Crypto, sports and the small games.
+#
+# The two that need the internet ask free services that answer without a key:
+# CoinGecko for the price of a coin, ESPN for a scoreboard. Everything else
+# is plain Python, so it works with no network at all.
+
+COINGECKO_PRICE_URL = "https://api.coingecko.com/api/v3/simple/price"
+COINGECKO_SEARCH_URL = "https://api.coingecko.com/api/v3/search"
+ESPN_SCOREBOARD_URL = (
+    "https://site.api.espn.com/apis/site/v2/sports/{sport}/{league}/scoreboard"
+)
+# A whole day of football is more games than anyone asked for.
+SPORTS_MAX_GAMES = 10
+# The names she is most likely to say, and the ids CoinGecko knows them by.
+CRYPTO_IDS = {
+    "bitcoin": "bitcoin", "btc": "bitcoin",
+    "ethereum": "ethereum", "eth": "ethereum",
+    "dogecoin": "dogecoin", "doge": "dogecoin",
+    "litecoin": "litecoin", "ltc": "litecoin",
+    "ripple": "ripple", "xrp": "ripple",
+    "cardano": "cardano", "ada": "cardano",
+    "solana": "solana", "sol": "solana",
+    "polkadot": "polkadot", "dot": "polkadot",
+    "chainlink": "chainlink", "link": "chainlink",
+    "binancecoin": "binancecoin", "bnb": "binancecoin",
+    "tron": "tron", "trx": "tron",
+    "monero": "monero", "xmr": "monero",
+    "bitcoin cash": "bitcoin-cash", "bch": "bitcoin-cash",
+    "stellar": "stellar", "xlm": "stellar",
+    "avalanche": "avalanche-2", "avax": "avalanche-2",
+    "shiba inu": "shiba-inu", "shib": "shiba-inu",
+    "dogwifhat": "dogwifhat", "wif": "dogwifhat",
+    "pepe": "pepe",
+    "uniswap": "uniswap", "uni": "uniswap",
+    "cosmos": "cosmos", "atom": "cosmos",
+    "ethereum classic": "ethereum-classic", "etc": "ethereum-classic",
+    "filecoin": "filecoin", "fil": "filecoin",
+    "hedera": "hedera", "hbar": "hedera",
+    "arbitrum": "arbitrum", "arb": "arbitrum",
+    "optimism": "optimism", "op": "optimism",
+    "aptos": "aptos", "apt": "aptos",
+    "sui": "sui",
+    "near": "near",
+    "vechain": "vechain", "vet": "vechain",
+    "zcash": "zcash", "zec": "zcash",
+    "tezos": "tezos", "xtz": "tezos",
+    "thorchain": "thorchain", "rune": "thorchain",
+    "algorand": "algorand", "algo": "algorand",
+    "aave": "aave",
+    "maker": "maker", "mkr": "maker",
+    "curve dao token": "curve-dao-token",
+    "lido dao": "lido-dao", "steth": "lido-dao",
+    "the open network": "the-open-network", "ton": "the-open-network",
+    "fantom": "fantom", "ftm": "fantom",
+    "gala": "gala",
+    "chiliz": "chiliz", "chz": "chiliz",
+    "flow": "flow",
+    "eos": "eos",
+    "neo": "neo",
+    "iota": "iota",
+    "render token": "render-token", "rndr": "render-token",
+    "immutable": "immutable", "imx": "immutable",
+    "worldcoin": "worldcoin-wld", "wld": "worldcoin-wld",
+    "sei": "sei-network",
+    "bonk": "bonk",
+    "floki": "floki",
+    "kaspa": "kaspa", "kas": "kaspa",
+    "axie infinity": "axie-infinity", "axs": "axie-infinity",
+    "the sandbox": "the-sandbox", "sand": "the-sandbox",
+    "decentraland": "decentraland", "mana": "decentraland",
+    "arweave": "arweave", "ar": "arweave",
+    "theta token": "theta-token", "theta": "theta-token",
+    "enjincoin": "enjincoin", "enj": "enjincoin",
+    "bitcoin cash sv": "bitcoin-cash-sv", "bsv": "bitcoin-cash-sv",
+}
+# The names to call them by, so the answer says Bitcoin and not bitcoin.
+CRYPTO_NAMES = {
+    "bitcoin": "Bitcoin", "ethereum": "Ethereum", "dogecoin": "Dogecoin",
+    "litecoin": "Litecoin", "ripple": "XRP", "cardano": "Cardano",
+    "solana": "Solana", "polkadot": "Polkadot", "chainlink": "Chainlink",
+    "binancecoin": "BNB", "tron": "Tron", "monero": "Monero",
+    "bitcoin-cash": "Bitcoin Cash", "stellar": "Stellar",
+    "avalanche-2": "Avalanche", "shiba-inu": "Shiba Inu",
+    "dogwifhat": "dogwifhat", "pepe": "Pepe", "uniswap": "Uniswap",
+    "cosmos": "Cosmos", "ethereum-classic": "Ethereum Classic",
+    "filecoin": "Filecoin", "hedera": "Hedera", "arbitrum": "Arbitrum",
+    "optimism": "Optimism", "aptos": "Aptos", "sui": "Sui",
+    "near": "NEAR Protocol", "vechain": "VeChain", "zcash": "Zcash",
+    "tezos": "Tezos", "thorchain": "THORChain", "algorand": "Algorand",
+    "aave": "Aave", "maker": "Maker", "curve-dao-token": "Curve DAO",
+    "lido-dao": "Lido DAO", "the-open-network": "Toncoin",
+    "fantom": "Fantom", "gala": "Gala", "chiliz": "Chiliz", "flow": "Flow",
+    "eos": "EOS", "neo": "Neo", "iota": "IOTA", "render-token": "Render",
+    "immutable": "Immutable", "worldcoin-wld": "Worldcoin",
+    "sei-network": "Sei", "bonk": "Bonk", "floki": "FLOKI",
+    "kaspa": "Kaspa", "axie-infinity": "Axie Infinity",
+    "the-sandbox": "The Sandbox", "decentraland": "Decentraland",
+    "arweave": "Arweave", "theta-token": "Theta Network",
+    "enjincoin": "Enjin Coin", "bitcoin-cash-sv": "Bitcoin Cash SV",
+}
+# Which league to ask ESPN for when she names a sport.
+SPORTS_LEAGUES = {
+    "football": ("football", "nfl"),
+    "american football": ("football", "nfl"),
+    "nfl": ("football", "nfl"),
+    "soccer": ("soccer", "eng.1"),
+    "football/soccer": ("soccer", "eng.1"),
+    "premier league": ("soccer", "eng.1"),
+    "epl": ("soccer", "eng.1"),
+    "basketball": ("basketball", "nba"),
+    "nba": ("basketball", "nba"),
+    "hockey": ("hockey", "nhl"),
+    "ice hockey": ("hockey", "nhl"),
+    "nhl": ("hockey", "nhl"),
+    "baseball": ("baseball", "mlb"),
+    "mlb": ("baseball", "mlb"),
+}
+
+
+# CoinGecko lets a handful of calls a minute through, so the last answer is
+# kept for a moment and the same coin is not asked for twice in a row.
+CRYPTO_CACHE_SECONDS = 60
+_CRYPTO_CACHE = {}
+
+
+KRAKEN_TICKER_URL = "https://api.kraken.com/0/public/Ticker"
+# Kraken's own names for the coins, which are not the same as CoinGecko's.
+# It is the second source, for when the first one is busy.
+KRAKEN_PAIRS = {
+    "bitcoin": "XBTUSD", "ethereum": "ETHUSD", "dogecoin": "XDGUSD",
+    "litecoin": "LTCUSD", "ripple": "XRPUSD", "cardano": "ADAUSD",
+    "solana": "SOLUSD", "polkadot": "DOTUSD", "chainlink": "LINKUSD",
+    "binancecoin": "BNBUSD", "tron": "TRXUSD", "monero": "XMRUSD",
+    "bitcoin-cash": "BCHUSD", "stellar": "XLMUSD", "avalanche-2": "AVAXUSD",
+    "shiba-inu": "SHIBUSD", "uniswap": "UNIUSD", "optimism": "OPUSD",
+    "arbitrum": "ARBUSD", "aptos": "APTUSD", "sui": "SUIUSD",
+    "near": "NEARUSD", "vechain": "VETUSD", "zcash": "ZECUSD",
+    "tezos": "XTZUSD", "algorand": "ALGOUSD", "aave": "AAVEUSD",
+    "gala": "GALAUSD", "chiliz": "CHZUSD", "flow": "FLOWUSD",
+    "neo": "NEOUSD", "render-token": "RENDERUSD", "floki": "FLOKIUSD",
+    "bonk": "BONKUSD", "kaspa": "KASUSD", "the-sandbox": "SANDUSD",
+    "decentraland": "MANAUSD", "enjincoin": "ENJUSD",
+    "worldcoin-wld": "WLDUSD", "sei-network": "SEIUSD",
+    "immutable": "IMXUSD", "dogwifhat": "WIFUSD", "pepe": "PEPEUSD",
+    "cosmos": "ATOMUSD", "filecoin": "FILUSD", "hedera": "HBARUSD",
+    "curve-dao-token": "CRVUSD", "lido-dao": "LDOUSD",
+    "ethereum-classic": "ETCUSD", "injective-protocol": "INJUSD",
+    "the-graph": "GRTUSD", "jupiter-exchange-solana": "JUPUSD",
+}
+
+
+def _crypto_coin_by_name(wanted):
+    """Ask CoinGecko which coin a name means, or None when it does not know."""
+    try:
+        response = _HTTP_SESSION.get(
+            COINGECKO_SEARCH_URL,
+            params={"query": wanted},
+            timeout=HTTP_REQUEST_TIMEOUT,
+            headers={"User-Agent": HTTP_USER_AGENT},
+        )
+        response.raise_for_status()
+        coins = response.json().get("coins") or []
+    except (requests.exceptions.RequestException, ValueError, AttributeError):
+        return None
+    if not coins:
+        return None
+    for coin in coins:
+        symbol = str(coin.get("symbol", "")).lower()
+        name = str(coin.get("name", "")).lower()
+        if wanted in (symbol, name):
+            return {"id": coin.get("id"), "name": coin.get("name")}
+    for coin in coins:
+        name = str(coin.get("name", "")).lower()
+        if name.startswith(wanted):
+            return {"id": coin.get("id"), "name": coin.get("name")}
+    return None
+
+
+def _crypto_price_data(coin_id):
+    """The price of a coin from CoinGecko, or a line saying why not.
+
+    The service lets a handful of calls a minute through, so a rate limit is
+    waited out once rather than given up on.
+    """
+    params = {
+        "ids": coin_id,
+        "vs_currencies": "usd",
+        "include_24hr_change": "true",
+        "include_market_cap": "true",
+    }
+    for attempt in range(2):
+        try:
+            response = _HTTP_SESSION.get(
+                COINGECKO_PRICE_URL,
+                params=params,
+                timeout=HTTP_REQUEST_TIMEOUT,
+                headers={"User-Agent": HTTP_USER_AGENT},
+            )
+        except requests.exceptions.RequestException as error:
+            return f"Error: the price lookup failed: {error}"
+        if response.status_code == 429:
+            if attempt == 0:
+                time.sleep(2)
+                continue
+            return "Error: the price service is busy right now, try again in a moment"
+        if response.status_code != 200:
+            return f"Error: the price lookup failed: {response.status_code}"
+        try:
+            return response.json().get(coin_id) or {}
+        except ValueError as error:
+            return f"Error: the price lookup failed: {error}"
+    return "Error: the price service is busy right now, try again in a moment"
+
+
+def _crypto_price_from_kraken(coin_id):
+    """The price of a coin from Kraken, in the shape CoinGecko gives.
+
+    The second source, for when the first one is busy. It has the price and
+    the day's change, but no market cap.
+    """
+    pair = KRAKEN_PAIRS.get(coin_id)
+    if not pair:
+        return None
+    try:
+        response = _HTTP_SESSION.get(
+            KRAKEN_TICKER_URL,
+            params={"pair": pair},
+            timeout=HTTP_REQUEST_TIMEOUT,
+            headers={"User-Agent": HTTP_USER_AGENT},
+        )
+        response.raise_for_status()
+        result = response.json().get("result") or {}
+    except (requests.exceptions.RequestException, ValueError, AttributeError):
+        return None
+    if not result:
+        return None
+    ticker = result.get(list(result)[0]) or {}
+    try:
+        price = float(ticker.get("c", [0])[0])
+        opened = float(ticker.get("o") or 0)
+    except (TypeError, ValueError, IndexError):
+        return None
+    if not price:
+        return None
+    data = {"usd": price}
+    if opened:
+        data["usd_24h_change"] = (price - opened) / opened * 100.0
+    return data
+
+
+def _crypto_price_text(price):
+    """A price with enough decimals to be worth reading.
+
+    A coin that costs a fraction of a cent is still a price, and two
+    decimals would call it free.
+    """
+    if abs(price) >= 1:
+        return f"${price:,.2f}"
+    text = f"${price:.10f}".rstrip("0")
+    if text.endswith("."):
+        text += "0"
+    return text
+
+
+def crypto_price(cryptocurrency):
+    """What a coin is doing right now.
+
+    CoinGecko answers without a key, so the price, the day's change and the
+    market cap are one request away. A coin whose id she does not know is
+    looked up by name first, so she can ask about any of them and not just
+    the famous ones.
+    """
+    wanted = str(cryptocurrency or "").strip().lower()
+    if not wanted:
+        return "Error: crypto_price needs a coin, like bitcoin"
+    coin_id = CRYPTO_IDS.get(wanted)
+    name = None
+    if coin_id is None:
+        found = _crypto_coin_by_name(wanted)
+        if not found or not found.get("id"):
+            return f"Error: no coin called {wanted} was found"
+        coin_id = found["id"]
+        name = found.get("name")
+    cached = _CRYPTO_CACHE.get(coin_id)
+    if cached and time.time() - cached[0] < CRYPTO_CACHE_SECONDS:
+        return cached[1]
+    data = _crypto_price_data(coin_id)
+    if isinstance(data, str):
+        # CoinGecko would not answer, so the other free service is asked.
+        fallback = _crypto_price_from_kraken(coin_id)
+        if not fallback:
+            return data
+        data = fallback
+    price = data.get("usd")
+    if price is None:
+        return f"Error: no price came back for {wanted}"
+    label = name or CRYPTO_NAMES.get(coin_id) or coin_id
+    lines = [f"{label}: {_crypto_price_text(price)}"]
+    change = data.get("usd_24h_change")
+    if isinstance(change, (int, float)):
+        lines.append(f"24h change: {change:+.2f}%")
+    market_cap = data.get("usd_market_cap")
+    if isinstance(market_cap, (int, float)):
+        lines.append(f"Market cap: ${market_cap:,.0f}")
+    answer = "\n".join(lines)
+    _CRYPTO_CACHE[coin_id] = (time.time(), answer)
+    return answer
+
+
+def _espn_game_line(event):
+    """One game from an ESPN scoreboard, as a line of text."""
+    competition = (event.get("competitions") or [{}])[0]
+    teams = []
+    for competitor in competition.get("competitors") or []:
+        team = competitor.get("team") or {}
+        label = (
+            team.get("abbreviation")
+            or team.get("shortDisplayName")
+            or team.get("displayName")
+            or "?"
+        )
+        teams.append(f"{label} {competitor.get('score', '')}".strip())
+    status = ((event.get("status") or {}).get("type") or {}).get("detail") or ""
+    line = " vs ".join(teams) if teams else str(event.get("name") or "game")
+    if status:
+        line = f"{line} ({status})"
+    return f"- {line}"
+
+
+def sports_scores(sport):
+    """The scores from a sport.
+
+    ESPN's scoreboard answers without a key, so the games of the day and how
+    they are going are one request away. The league can be named after a bar,
+    as in "soccer|uefa.champions".
+    """
+    wanted = str(sport or "").strip().lower()
+    if not wanted:
+        return (
+            "Error: sports_scores needs a sport: football, soccer, "
+            "basketball, hockey or baseball"
+        )
+    league = ""
+    if "|" in wanted:
+        wanted, league = [part.strip() for part in wanted.split("|", 1)]
+    mapping = SPORTS_LEAGUES.get(wanted)
+    if mapping is None:
+        return (
+            f"Error: I know football, soccer, basketball, hockey and baseball, "
+            f"not {wanted}"
+        )
+    sport_name, default_league = mapping
+    league = league or default_league
+    try:
+        response = _HTTP_SESSION.get(
+            ESPN_SCOREBOARD_URL.format(sport=sport_name, league=league),
+            timeout=HTTP_REQUEST_TIMEOUT,
+            headers={"User-Agent": HTTP_USER_AGENT},
+        )
+        response.raise_for_status()
+        events = response.json().get("events") or []
+    except (requests.exceptions.RequestException, ValueError, AttributeError) as error:
+        return f"Error: the scoreboard did not answer: {error}"
+    if not events:
+        return f"No {sport_name} games are on right now."
+    lines = [f"{sport_name} ({league}), {len(events)} game(s):"]
+    for event in events[:SPORTS_MAX_GAMES]:
+        lines.append(_espn_game_line(event))
+    return "\n".join(lines)
+
+
+def _number_arg(arg, default):
+    """The first number inside a tool argument, or the default."""
+    if arg is None:
+        return default
+    match = re.search(r"-?\d+", str(arg))
+    if not match:
+        return default
+    try:
+        return int(match.group(0))
+    except ValueError:
+        return default
+
+
+def _numbers_in(arg):
+    """The numbers in a tool argument, which may be split by | or a comma."""
+    text = str(arg or "").strip()
+    if not text:
+        return []
+    if "|" in text:
+        parts = text.split("|")
+    elif "," in text:
+        parts = text.split(",")
+    else:
+        parts = [text]
+    numbers = []
+    for part in parts:
+        match = re.search(r"-?\d+", part)
+        if match:
+            numbers.append(int(match.group(0)))
+    return numbers
+
+
+def _random_range(arg):
+    """The two ends of a random number range, from one tool argument."""
+    numbers = _numbers_in(arg)
+    if not numbers:
+        return 1, 100
+    if len(numbers) == 1:
+        return 1, numbers[0]
+    return numbers[0], numbers[1]
+
+
+def _lottery_pick(arg):
+    """How many lottery numbers, and how high they go, from one argument."""
+    numbers = _numbers_in(arg)
+    if not numbers:
+        return 6, 49
+    if len(numbers) == 1:
+        return numbers[0], 49
+    return numbers[0], numbers[1]
+
+
+def dice(sides=6):
+    """Roll a dice with the given number of sides."""
+    count = _number_arg(sides, None)
+    if count is None:
+        return "Error: the number of sides has to be a whole number"
+    if count < 2 or count > 1000:
+        return "Error: a dice needs between 2 and 1000 sides"
+    result = random.randint(1, count)
+    return f"The {count}-sided dice came up {result}."
+
+
+def coin_flip():
+    """Flip a coin."""
+    result = random.choice(("heads", "tails"))
+    return f"The coin came up {result}."
+
+
+def random_number(minimum=1, maximum=100):
+    """A random number between the two ends."""
+    low = _number_arg(minimum, None)
+    high = _number_arg(maximum, None)
+    if low is None or high is None:
+        return "Error: the two ends of the range have to be whole numbers"
+    if low > high:
+        low, high = high, low
+    return f"A random number between {low} and {high}: {random.randint(low, high)}"
+
+
+def lottery_numbers(count=6, maximum=49):
+    """A line of lottery numbers."""
+    how_many = _number_arg(count, None)
+    highest = _number_arg(maximum, None)
+    if how_many is None or highest is None:
+        return "Error: the count and the highest number have to be whole numbers"
+    if how_many < 1 or how_many > 20:
+        return "Error: between 1 and 20 numbers can be drawn"
+    if highest < how_many:
+        return "Error: the highest number has to be at least the number of numbers"
+    numbers = sorted(random.sample(range(1, highest + 1), how_many))
+    return (
+        f"{how_many} numbers from 1 to {highest}: "
+        + ", ".join(str(number) for number in numbers)
+    )
+
+
+# The little block font the ASCII art is drawn in. Every glyph is five rows
+# of five, written out with slashes between the rows.
+ASCII_FONT = {
+    "A": " ### /#   #/#   #/#####/#   #",
+    "B": "#### /#   #/#### /#   #/#### ",
+    "C": " ####/#    /#    /#    / ####",
+    "D": "#### /#   #/#   #/#   #/#### ",
+    "E": "#####/#    /#### /#    /#####",
+    "F": "#####/#    /#### /#    /#    ",
+    "G": " ####/#    /#  ##/#   #/ ####",
+    "H": "#   #/#   #/#####/#   #/#   #",
+    "I": " ### /  #  /  #  /  #  / ### ",
+    "J": "   ##/    #/    #/#   #/ ### ",
+    "K": "#   #/#  # /###  /#  # /#   #",
+    "L": "#    /#    /#    /#    /#####",
+    "M": "#   #/## ##/# # #/#   #/#   #",
+    "N": "#   #/##  #/# # #/#  ##/#   #",
+    "O": " ### /#   #/#   #/#   #/ ### ",
+    "P": "#### /#   #/#### /#    /#    ",
+    "Q": " ### /#   #/# # #/#  # / ## #",
+    "R": "#### /#   #/#### /#  # /#   #",
+    "S": " ####/#    / ### /    #/#### ",
+    "T": "#####/  #  /  #  /  #  /  #  ",
+    "U": "#   #/#   #/#   #/#   #/ ### ",
+    "V": "#   #/#   #/#   #/ # # /  #  ",
+    "W": "#   #/#   #/# # #/## ##/#   #",
+    "X": "#   #/ # # /  #  / # # /#   #",
+    "Y": "#   #/ # # /  #  /  #  /  #  ",
+    "Z": "#####/   # /  #  / #   /#####",
+    "0": " ### /#  ##/# # #/##  #/ ### ",
+    "1": "  #  / ##  /  #  /  #  / ### ",
+    "2": " ### /#   #/  ## / #   /#####",
+    "3": "#### /    #/ ### /    #/#### ",
+    "4": "#  # /#  # /#####/   # /   # ",
+    "5": "#####/#    /#### /    #/#### ",
+    "6": " ### /#    /#### /#   #/ ### ",
+    "7": "#####/    #/   # /  #  / #   ",
+    "8": " ### /#   #/ ### /#   #/ ### ",
+    "9": " ### /#   #/ ####/    #/ ### ",
+    " ": "     /     /     /     /     ",
+    ".": "     /     /     /     /  #  ",
+    ",": "     /     /     /  #  / #   ",
+    "!": "  #  /  #  /  #  /     /  #  ",
+    "?": " ### /#   #/  #  /     /  #  ",
+    "'": "  #  /  #  /     /     /     ",
+    "-": "     /     /#####/     /     ",
+    "+": "     /  #  /#####/  #  /     ",
+    ":": "     /  #  /     /  #  /     ",
+    ";": "     /  #  /     /  #  /  #  ",
+    "/": "    #/   # /  #  / #   /#    ",
+    "(": "   # /  #  /  #  /  #  /   # ",
+    ")": " #   /  #  /  #  /  #  / #   ",
+    "[": " ### / #  / #  / #  / ### ",
+    "]": "###  /  # /  # /  # /###  ",
+    "*": "     /# # #/ ### /# # #/     ",
+    "=": "     /#####/     /#####/     ",
+    "#": " # # /#####/ # # /#####/ # # ",
+    "&": " ##  /#  #/# # #/#  # / ## #",
+    "@": " ### /#   #/# # #/#   #/ ### ",
+    "$": " ####/#  # /###  /  # /#### ",
+    "%": " #  #/#  #/  #  /#  #/#  # ",
+    "<": "   # /  #  / #   /  #  /   # ",
+    ">": " #   /  #  /   # /  #  / #   ",
+    "^": "  #  / # # /#   #/     /     ",
+    "~": "     / #  #/# # /     /     ",
+    "_": "     /     /     /     /#####",
+    '"': " # # / # # /     /     /     ",
+}
+
+
+def _ascii_block(text):
+    """Text drawn in the little block font."""
+    rows = ["", "", "", "", ""]
+    for char in str(text or "").upper():
+        glyph = ASCII_FONT.get(char)
+        if glyph is None:
+            glyph = ASCII_FONT["?"]
+        parts = glyph.split("/")
+        for index in range(5):
+            rows[index] += parts[index] + " "
+    return "\n".join(row.rstrip() for row in rows)
+
+
+def ascii_art(text):
+    """Text as ASCII art, in the little block font."""
+    wanted = str(text or "").strip()
+    if not wanted:
+        return "Error: ascii_art needs some text"
+    return _ascii_block(wanted)
+
+
+def text_to_ascii(text):
+    """Text as ASCII art.
+
+    PyFiglet is used when it is installed, because its fonts are the good
+    ones. Without it the little block font is used instead, so the tool still
+    answers.
+    """
+    wanted = str(text or "").strip()
+    if not wanted:
+        return "Error: text_to_ascii needs some text"
+    try:
+        import pyfiglet
+    except ImportError:
+        pyfiglet = None
+    if pyfiglet is not None:
+        try:
+            art = pyfiglet.figlet_format(wanted)
+        except Exception:
+            art = ""
+        if art.strip():
+            return art.rstrip()
+    return _ascii_block(wanted)
+
+
+# The standard Morse code. The letters and the digits are enough for most
+# of what she is asked, with the common punctuation on the end.
+MORSE_CODE = {
+    "A": ".-", "B": "-...", "C": "-.-.", "D": "-..", "E": ".",
+    "F": "..-.", "G": "--.", "H": "....", "I": "..", "J": ".---",
+    "K": "-.-", "L": ".-..", "M": "--", "N": "-.", "O": "---",
+    "P": ".--.", "Q": "--.-", "R": ".-.", "S": "...", "T": "-",
+    "U": "..-", "V": "...-", "W": ".--", "X": "-..-", "Y": "-.--",
+    "Z": "--..",
+    "0": "-----", "1": ".----", "2": "..---", "3": "...--", "4": "....-",
+    "5": ".....", "6": "-....", "7": "--...", "8": "---..", "9": "----.",
+    ".": ".-.-.-", ",": "--..--", "?": "..--..", "'": ".----.",
+    "!": "-.-.-", "/": "-..-.", "(": "-.--.", ")": "-.--.-",
+    "&": ".-...", ":": "---...", ";": "-.-.-.", "=": "-...-",
+    "+": ".-.-.", "-": "-....-", "_": "..--.-", '"': ".-..-.",
+    "$": "...-..-", "@": ".--.-.",
+}
+MORSE_REVERSE = {code: letter for letter, code in MORSE_CODE.items()}
+
+
+def morse_code(text):
+    """Morse code, in either direction.
+
+    Dots and dashes in the text mean it is Morse already and are read back
+    into words; anything else is written out as Morse.
+    """
+    wanted = str(text or "").strip()
+    if not wanted:
+        return "Error: morse_code needs some text"
+    letters = wanted.replace(" ", "")
+    if letters and all(char in ".-/" for char in letters):
+        words = []
+        for word in wanted.split("/"):
+            decoded = []
+            for group in word.split():
+                letter = "".join(
+                    MORSE_REVERSE.get(code, "?") for code in group.split()
+                )
+                decoded.append(letter)
+            words.append(" ".join(decoded))
+        return "Morse read back: " + " / ".join(words)
+    encoded = []
+    for char in wanted.upper():
+        code = MORSE_CODE.get(char)
+        if code is None:
+            continue
+        encoded.append(code)
+    if not encoded:
+        return "Error: none of that can be written as Morse"
+    return "Morse code: " + " ".join(encoded)
+
+
+# Code 39, the barcode that nearly everything can read. Each character is
+# nine elements, a bar or a space, and three of them are wide.
+CODE39_PATTERNS = {
+    "0": "nnnwwnwnn", "1": "wnnwnnnnw", "2": "nnwwnnnnw",
+    "3": "wnwwnnnnn", "4": "nnnwwnnnw", "5": "wnnwwnnnn",
+    "6": "nnwwwnnnn", "7": "nnnwnnwnw", "8": "wnnwnnwnn",
+    "9": "nnwwnnwnn",
+    "A": "wnnnnwnnw", "B": "nnwnnwnnw", "C": "wnwnnwnnn",
+    "D": "nnnnwwnnw", "E": "wnnnwwnnn", "F": "nnwnwwnnn",
+    "G": "nnnnnwwnw", "H": "wnnnnwwnn", "I": "nnwnnwwnn",
+    "J": "nnnnwwwnn",
+    "K": "wnnnnnnww", "L": "nnwnnnnww", "M": "wnwnnnnwn",
+    "N": "nnnnwnnww", "O": "wnnnwnnwn", "P": "nnwnwnnwn",
+    "Q": "nnnnnnwww", "R": "wnnnnnwwn", "S": "nnwnnnwwn",
+    "T": "nnnnwnwwn",
+    "U": "wwnnnnnnw", "V": "nwwnnnnnw", "W": "wwwnnnnnn",
+    "X": "nwnnwnnnw", "Y": "wwnnwnnnn", "Z": "nwwnwnnnn",
+    "-": "nwnnnnwnw", ".": "wwnnnnwnn", " ": "nwwnnnwnn",
+    "$": "nwnwnwnnn", "/": "nwnwnnnwn", "+": "nwnnnwnwn",
+    "%": "nnnwnwnwn", "*": "nwnnwnwnn",
+}
+# A narrow bar is one unit and a wide one is three, and the picture is this
+# many pixels wide for each unit.
+BARCODE_MODULE_PX = 2
+BARCODE_HEIGHT = 80
+# The white border a scanner needs on both sides.
+BARCODE_QUIET = 10
+
+
+def _png_data_url(width, height, row):
+    """A grayscale PNG of one row of pixels, repeated down the page."""
+    import base64
+    import struct
+    import zlib
+
+    raw = b"".join(b"\x00" + bytes(row) for _ in range(height))
+
+    def chunk(tag, data):
+        return (
+            struct.pack(">I", len(data))
+            + tag
+            + data
+            + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+        )
+
+    header = struct.pack(">IIBBBBB", width, height, 8, 0, 0, 0, 0)
+    png = (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", zlib.compress(raw, 9))
+        + chunk(b"IEND", b"")
+    )
+    return "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+
+
+def _barcode_picture(text):
+    """A Code 39 barcode as a PNG data URL, or None when it cannot be made."""
+    clean = "".join(char for char in text.upper() if char in CODE39_PATTERNS)
+    if not clean:
+        return None
+    widths = []
+    for char in "*" + clean + "*":
+        pattern = CODE39_PATTERNS[char]
+        for element in pattern:
+            widths.append(3 if element == "w" else 1)
+        # The narrow gap between two characters.
+        widths.append(1)
+    # No gap after the last character, the quiet zone is there instead.
+    widths = widths[:-1]
+    row = bytearray()
+    row.extend(b"\xff" * (BARCODE_QUIET * BARCODE_MODULE_PX))
+    bar = True
+    for width in widths:
+        row.extend(bytes([0 if bar else 255]) * (width * BARCODE_MODULE_PX))
+        bar = not bar
+    row.extend(b"\xff" * (BARCODE_QUIET * BARCODE_MODULE_PX))
+    return _png_data_url(len(row), BARCODE_HEIGHT, row)
+
+
+def barcode(text):
+    """A barcode for a piece of text.
+
+    The code is drawn here, in Code 39, and handed back as a picture in a
+    data URL, so it works with no service and no key. A free service is the
+    fallback for when the drawing cannot be made.
+    """
+    wanted = str(text or "").strip()
+    if not wanted:
+        return "Error: barcode needs some text"
+    picture = _barcode_picture(wanted)
+    if picture:
+        return f"Barcode for {wanted}: {picture}"
+    url = (
+        "https://barcodeapi.io/api/v2/barcode?text="
+        + urllib.parse.quote(wanted)
+        + "&format=png"
+    )
+    return f"Barcode for {wanted}: {url}"
+
+
+# -----------------------------
+# Calendar, scheduling and music tools. The calendar and the timers are their
+# own little JSON files next to this script, the same way the reminders are.
+
+
+CALENDAR_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "kookie_calendar.json"
+)
+TIMER_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "kookie_timers.json"
+)
+
+# A4 is 440 Hz and one semitone is the twelfth root of two.
+NOTE_SEMITONES = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
+NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+# The shapes of the scales, as semitone steps up from the root note.
+SCALE_STEPS = {
+    "major": [0, 2, 4, 5, 7, 9, 11],
+    "minor": [0, 2, 3, 5, 7, 8, 10],
+    "harmonic minor": [0, 2, 3, 5, 7, 8, 11],
+    "melodic minor": [0, 2, 3, 5, 7, 9, 11],
+    "pentatonic": [0, 2, 4, 7, 9],
+    "pentatonic major": [0, 2, 4, 7, 9],
+    "pentatonic minor": [0, 3, 5, 7, 10],
+    "blues": [0, 3, 5, 6, 7, 10],
+}
+
+
+def _read_json_list(path):
+    """Read a list of things from a JSON file, or an empty list if it is gone."""
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return []
+    return data if isinstance(data, list) else []
+
+
+def _write_json_list(path, data):
+    """Put a list of things back into its JSON file."""
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=2)
+
+
+def _number_from(text, default=None):
+    """Pull the first number out of a piece of text, or the default."""
+    match = re.search(r"-?\d+(?:\.\d+)?", str(text or ""))
+    if not match:
+        return default
+    try:
+        return float(match.group(0))
+    except ValueError:
+        return default
+
+
+def _note_to_midi(note):
+    """The MIDI number of a note name like A4, C#5 or Bb3."""
+    text = str(note or "").strip().replace(" ", "")
+    match = re.match(r"^([A-Ga-g])([#b]*)(-?\d+)?$", text)
+    if not match:
+        raise ValueError(f"'{note}' is not a note name")
+    letter = match.group(1).upper()
+    semitone = NOTE_SEMITONES[letter]
+    for mark in match.group(2):
+        semitone += 1 if mark == "#" else -1
+    octave = int(match.group(3)) if match.group(3) is not None else 4
+    return (octave + 1) * 12 + semitone
+
+
+def add_event(date, time, title):
+    """Put one event on the calendar."""
+    try:
+        day = str(date or "").strip()
+        clock = str(time or "").strip()
+        name = str(title or "").strip() or "(no title)"
+        if not day:
+            return "Error: add_event needs a date like 2026-10-22"
+        try:
+            datetime.strptime(day, "%Y-%m-%d")
+        except ValueError:
+            return "Error: the date has to look like YYYY-MM-DD"
+        if clock:
+            try:
+                datetime.strptime(clock, "%H:%M")
+            except ValueError:
+                return "Error: the time has to look like HH:MM"
+        events = _read_json_list(CALENDAR_FILE)
+        events.append({
+            "date": day,
+            "time": clock,
+            "title": name,
+            "created": datetime.now().isoformat(timespec="seconds"),
+        })
+        _write_json_list(CALENDAR_FILE, events)
+        return f"Event added: '{name}' on {day} at {clock or 'no time set'}"
+    except Exception as e:
+        return f"Error adding event: {e}"
+
+
+def list_events(date=None):
+    """Show the events for one day, or the ones still coming up."""
+    try:
+        events = _read_json_list(CALENDAR_FILE)
+        if not events:
+            return "There are no events on the calendar."
+        wanted = str(date).strip() if date else ""
+        today = datetime.now().date().isoformat()
+        picked = []
+        for event in events:
+            day = str(event.get("date", "")).strip()
+            if wanted:
+                if day == wanted:
+                    picked.append(event)
+            elif day >= today:
+                picked.append(event)
+        if not picked:
+            if wanted:
+                return f"There are no events on {wanted}."
+            return "There are no upcoming events."
+        picked.sort(key=lambda event: (str(event.get("date", "")), str(event.get("time", ""))))
+        lines = []
+        for event in picked[:20]:
+            stamp = str(event.get("date", ""))
+            clock = str(event.get("time", "")).strip()
+            if clock:
+                stamp += " at " + clock
+            lines.append(f"- {stamp}: {event.get('title', '')}")
+        if len(picked) > 20:
+            lines.append(f"- and {len(picked) - 20} more")
+        header = f"Events on {wanted}:" if wanted else "Upcoming events:"
+        return header + "\n" + "\n".join(lines)
+    except Exception as e:
+        return f"Error listing events: {e}"
+
+
+def countdown(target_date):
+    """Count the days, hours and minutes left until a date."""
+    try:
+        raw = str(target_date or "").strip()
+        if not raw:
+            return "Error: countdown needs a date like 2026-10-22"
+        label = ""
+        if "|" in raw:
+            raw, label = [part.strip() for part in raw.split("|", 1)]
+        try:
+            target = datetime.strptime(raw, "%Y-%m-%d")
+        except ValueError:
+            return "Error: the date has to look like YYYY-MM-DD"
+        seconds = (target - datetime.now()).total_seconds()
+        what = label or raw
+        if seconds < 0:
+            days = abs(seconds) / 86400.0
+            return f"{what} was {days:.1f} days ago ({raw})."
+        days = int(seconds // 86400)
+        hours = int((seconds % 86400) // 3600)
+        minutes = int((seconds % 3600) // 60)
+        return f"{days} days, {hours} hours and {minutes} minutes until {what} ({raw})."
+    except Exception as e:
+        return f"Error counting down: {e}"
+
+
+def sleep_timer(minutes, note=""):
+    """Set a timer and leave a note about it for later."""
+    try:
+        wait = _number_from(minutes)
+        if wait is None:
+            return "Error: sleep_timer needs a number of minutes"
+        if wait <= 0:
+            return "Error: sleep_timer needs more than 0 minutes"
+        due = datetime.now() + timedelta(minutes=wait)
+        timers = _read_json_list(TIMER_FILE)
+        timers.append({
+            "minutes": wait,
+            "due": due.isoformat(timespec="seconds"),
+            "note": str(note or "").strip() or f"sleep timer for {wait:g} minutes",
+            "created": datetime.now().isoformat(timespec="seconds"),
+        })
+        _write_json_list(TIMER_FILE, timers)
+        return f"Sleep timer set: {wait:g} minutes from now, done at {due.strftime('%Y-%m-%d %H:%M')}."
+    except Exception as e:
+        return f"Error setting sleep timer: {e}"
+
+
+def generate_tone(frequency=440, duration=1):
+    """Write a sine tone to a WAV file and say where it went."""
+    try:
+        import struct
+        import wave
+
+        freq = _number_from(frequency, 440.0)
+        seconds = _number_from(duration, 1.0)
+        if freq <= 0:
+            return "Error: the frequency has to be more than 0 Hz"
+        if seconds <= 0 or seconds > 60:
+            return "Error: the duration has to be between 0 and 60 seconds"
+        rate = 44100
+        count = int(rate * seconds)
+        path = os.path.join(
+            tempfile.gettempdir(), f"kookie_tone_{int(round(freq))}hz_{seconds:g}s.wav"
+        )
+        try:
+            import numpy as np
+        except ImportError:
+            np = None
+        if np is not None:
+            samples = (
+                np.sin(2 * np.pi * freq * np.arange(count) / rate) * 32767
+            ).astype(np.int16)
+            audio = samples.tobytes()
+        else:
+            audio = b"".join(
+                struct.pack("<h", int(32767 * math.sin(2 * math.pi * freq * i / rate)))
+                for i in range(count)
+            )
+        with wave.open(path, "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(rate)
+            handle.writeframes(audio)
+        return path
+    except Exception as e:
+        return f"Error generating tone: {e}"
+
+
+def generate_scale(root="C", octave=4, scale_type=""):
+    """The frequencies of a scale, from the root note up."""
+    try:
+        name = str(root or "C").strip()
+        kind = str(scale_type or "").strip().lower()
+        words = name.split()
+        if not kind:
+            for size in (3, 2, 1):
+                if len(words) < size:
+                    continue
+                candidate = " ".join(words[-size:]).lower()
+                if candidate in SCALE_STEPS:
+                    kind = candidate
+                    name = " ".join(words[:-size])
+                    break
+        if not kind:
+            kind = "major"
+        if kind not in SCALE_STEPS:
+            return "Error: I know these scales: " + ", ".join(sorted(SCALE_STEPS))
+        match = re.match(r"^([A-Ga-g])([#b]*)(-?\d+)?$", name.replace(" ", ""))
+        if not match:
+            return f"Error: '{root}' is not a note name"
+        letter = match.group(1).upper()
+        semitone = NOTE_SEMITONES[letter]
+        for mark in match.group(2):
+            semitone += 1 if mark == "#" else -1
+        if match.group(3) is not None:
+            octave_number = int(match.group(3))
+        else:
+            octave_number = int(_number_from(octave, 4))
+        frequencies = []
+        for step in SCALE_STEPS[kind]:
+            midi = (octave_number + 1) * 12 + semitone + step
+            frequencies.append(round(440.0 * (2.0 ** ((midi - 69) / 12.0)), 2))
+        return frequencies
+    except Exception as e:
+        return f"Error building the scale: {e}"
+
+
+def note_to_frequency(note):
+    """The frequency in Hz of a note name like A4 or C#5."""
+    try:
+        midi = _note_to_midi(note)
+    except ValueError as error:
+        return f"Error: {error}"
+    return 440.0 * (2.0 ** ((midi - 69) / 12.0))
+
+
+def frequency_to_note(freq):
+    """The nearest note name to a frequency in Hz."""
+    try:
+        value = _number_from(freq)
+        if value is None:
+            return "Error: frequency_to_note needs a frequency in Hz"
+        if value <= 0:
+            return "Error: the frequency has to be more than 0 Hz"
+        midi = int(round(69 + 12 * math.log2(value / 440.0)))
+        return f"{NOTE_NAMES[midi % 12]}{midi // 12 - 1}"
+    except Exception as e:
+        return f"Error converting the frequency: {e}"
+
+
+
+
+def create_archive(arg):
+    """Create a compressed archive. Arg format: archive_type|file1,file2|output.zip"""
+    try:
+        raw = str(arg or "").strip()
+        parts = [p.strip() for p in raw.split("|")]
+        if len(parts) != 3:
+            return "Error: create_archive needs 'zip|file1,file2|output.zip'"
+        archive_type = parts[0].strip().lower()
+        files_str = parts[1]
+        output = parts[2].strip()
+        if not files_str:
+            return "Error: no files specified"
+        file_list = [f.strip() for f in files_str.split(",") if f.strip()]
+        out_sp = _safe_path(output)
+        if out_sp is None:
+            return "Error: output path outside allowed area"
+        os.makedirs(os.path.dirname(out_sp) or ".", exist_ok=True)
+        if archive_type == "zip":
+            import zipfile
+            with zipfile.ZipFile(out_sp, "w", zipfile.ZIP_DEFLATED) as zf:
+                for f in file_list:
+                    sp = _safe_path(f)
+                    if sp is None or not os.path.exists(sp):
+                        continue
+                    zf.write(sp, os.path.basename(sp))
+            return out_sp
+        elif archive_type == "tar.gz":
+            import tarfile
+            with tarfile.open(out_sp, "w:gz") as tf:
+                for f in file_list:
+                    sp = _safe_path(f)
+                    if sp is None or not os.path.exists(sp):
+                        continue
+                    tf.add(sp, arcname=os.path.basename(sp))
+            return out_sp
+        elif archive_type == "tar.bz2":
+            import tarfile
+            with tarfile.open(out_sp, "w:bz2") as tf:
+                for f in file_list:
+                    sp = _safe_path(f)
+                    if sp is None or not os.path.exists(sp):
+                        continue
+                    tf.add(sp, arcname=os.path.basename(sp))
+            return out_sp
+        else:
+            return "Error: supports zip, tar.gz, tar.bz2"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def extract_archive(arg):
+    """Extract an archive. Arg format: archive.zip|/tmp/extracted"""
+    try:
+        raw = str(arg or "").strip()
+        parts = [p.strip() for p in raw.split("|")]
+        if len(parts) < 2:
+            return "Error: extract_archive needs 'archive|output_dir'"
+        archive_path = parts[0]
+        output_dir = parts[1] if len(parts) > 1 else "/tmp/extracted"
+        ap = _safe_path(archive_path)
+        out_sp = _safe_path(output_dir)
+        if ap is None or out_sp is None:
+            return "Error: path outside allowed area"
+        if not os.path.isfile(ap):
+            return "Error: archive not found"
+        os.makedirs(out_sp, exist_ok=True)
+        extracted = []
+        ext = os.path.splitext(ap)[1].lower()
+        if ext == ".zip":
+            import zipfile
+            with zipfile.ZipFile(ap, "r") as zf:
+                zf.extractall(out_sp)
+                extracted = zf.namelist()
+        elif ext in (".tar", ".tgz") or ap.endswith((".tar.gz", ".tar.bz2")):
+            import tarfile
+            mode = "r:*"
+            with tarfile.open(ap, mode) as tf:
+                tf.extractall(out_sp)
+                extracted = [m.name for m in tf.getmembers()]
+        else:
+            return "Error: unsupported archive format"
+        return extracted
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def list_archive(arg):
+    """List contents of an archive."""
+    try:
+        archive_path = str(arg or "").strip()
+        ap = _safe_path(archive_path)
+        if ap is None:
+            return "Error: path outside allowed area"
+        if not os.path.isfile(ap):
+            return "Error: archive not found"
+        ext = os.path.splitext(ap)[1].lower()
+        if ext == ".zip":
+            import zipfile
+            with zipfile.ZipFile(ap, "r") as zf:
+                result = []
+                for info in zf.infolist():
+                    result.append(f"{info.filename} ({info.file_size} bytes)")
+                return "\n".join(result) if result else "Empty archive"
+        elif ext in (".tar", ".tgz") or ap.endswith((".tar.gz", ".tar.bz2")):
+            import tarfile
+            with tarfile.open(ap, "r:*") as tf:
+                result = []
+                for m in tf.getmembers():
+                    result.append(f"{m.name} ({m.size} bytes)")
+                return "\n".join(result) if result else "Empty archive"
+        else:
+            return "Error: unsupported archive format"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def read_pdf(arg):
+    """Extract text from a PDF file."""
+    try:
+        file_path = str(arg or "").strip()
+        sp = _safe_path(file_path)
+        if sp is None:
+            return "Error: path outside project directory"
+        base = os.path.basename(sp)
+        if base in _SENSITIVE_FILES or base.endswith(".env") or "token" in base.lower():
+            return "Error: sensitive file"
+        if not os.path.isfile(sp):
+            return "Error: file not found"
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(sp)
+            text = []
+            for page in reader.pages:
+                text.append(page.extract_text() or "")
+            return "\n\n".join(text)
+        except ImportError:
+            try:
+                import PyPDF2
+                reader = PyPDF2.PdfReader(sp)
+                text = []
+                for page in reader.pages:
+                    text.append(page.extract_text() or "")
+                return "\n\n".join(text)
+            except Exception:
+                return "Error: pypdf or PyPDF2 not available"
+        except Exception as e:
+            return f"Error: {e}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def pdf_to_text(arg):
+    """Convert a PDF to a text file. Arg format: file.pdf|output.txt"""
+    try:
+        raw = str(arg or "").strip()
+        parts = [p.strip() for p in raw.split("|")]
+        if len(parts) != 2:
+            return "Error: pdf_to_text needs 'file.pdf|output.txt'"
+        file_path = parts[0]
+        output_path = parts[1]
+        sp = _safe_path(file_path)
+        out_sp = _safe_path(output_path)
+        if sp is None or out_sp is None:
+            return "Error: path outside allowed area"
+        base = os.path.basename(sp)
+        if base in _SENSITIVE_FILES or base.endswith(".env") or "token" in base.lower():
+            return "Error: sensitive file"
+        if not os.path.isfile(sp):
+            return "Error: file not found"
+        text = None
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(sp)
+            text_parts = []
+            for page in reader.pages:
+                text_parts.append(page.extract_text() or "")
+            text = "\n\n".join(text_parts)
+        except ImportError:
+            try:
+                import PyPDF2
+                reader = PyPDF2.PdfReader(sp)
+                text_parts = []
+                for page in reader.pages:
+                    text_parts.append(page.extract_text() or "")
+                text = "\n\n".join(text_parts)
+            except Exception:
+                return "Error: pypdf not available"
+        except Exception as e:
+            return f"Error: {e}"
+        if text is None:
+            return "Error: could not extract text"
+        os.makedirs(os.path.dirname(out_sp) or ".", exist_ok=True)
+        with open(out_sp, "w", encoding="utf-8") as f:
+            f.write(text)
+        return out_sp
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def image_to_pdf(arg):
+    """Convert images to a PDF. Arg format: img1.jpg,img2.png|output.pdf"""
+    try:
+        Image = _pil_image()
+        if Image is None:
+            return "Error: PIL not available"
+        raw = str(arg or "").strip()
+        parts = [p.strip() for p in raw.split("|")]
+        if len(parts) != 2:
+            return "Error: image_to_pdf needs 'img1.jpg,img2.png|output.pdf'"
+        images_str = parts[0]
+        output_path = parts[1]
+        out_sp = _safe_path(output_path)
+        if out_sp is None:
+            return "Error: output path outside allowed area"
+        image_list = [i.strip() for i in images_str.split(",") if i.strip()]
+        pil_images = []
+        for img in image_list:
+            ip = _safe_path(img)
+            if ip is None or not os.path.isfile(ip):
+                continue
+            im = Image.open(ip)
+            if im.mode == "RGBA":
+                im = im.convert("RGB")
+            elif im.mode != "RGB":
+                im = im.convert("RGB")
+            pil_images.append(im)
+        if not pil_images:
+            return "Error: no valid images"
+        os.makedirs(os.path.dirname(out_sp) or ".", exist_ok=True)
+        pil_images[0].save(out_sp, save_all=True, append_images=pil_images[1:] if len(pil_images) > 1 else [])
+        return out_sp
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def apply_filter(arg):
+    """Apply a simple image filter. Arg format: image.png|filter_type"""
+    try:
+        Image = _pil_image()
+        if Image is None:
+            return "Error: PIL not available"
+        raw = str(arg or "").strip()
+        parts = [p.strip() for p in raw.split("|")]
+        if len(parts) != 2:
+            return "Error: apply_filter needs 'image.png|grayscale|sepia|invert|blur'"
+        image_path = parts[0]
+        filter_type = parts[1].strip().lower()
+        ip = _safe_path(image_path)
+        if ip is None or not os.path.isfile(ip):
+            return "Error: image not found"
+        with Image.open(ip) as im:
+            im.load()
+            if filter_type == "grayscale":
+                from PIL import ImageOps
+                filtered = ImageOps.grayscale(im).convert("RGB")
+            elif filter_type == "sepia":
+                filtered = Image.new("RGB", im.size)
+                pixels = im.convert("RGB").load()
+                new_pixels = filtered.load()
+                for y in range(im.size[1]):
+                    for x in range(im.size[0]):
+                        r, g, b = pixels[x, y]
+                        tr = int(0.393 * r + 0.769 * g + 0.189 * b)
+                        tg = int(0.349 * r + 0.686 * g + 0.168 * b)
+                        tb = int(0.272 * r + 0.534 * g + 0.131 * b)
+                        new_pixels[x, y] = (min(255, tr), min(255, tg), min(255, tb))
+            elif filter_type == "invert":
+                from PIL import ImageOps
+                filtered = ImageOps.invert(im.convert("RGB"))
+            elif filter_type == "blur":
+                from PIL import ImageFilter
+                filtered = im.convert("RGB").filter(ImageFilter.BLUR)
+            else:
+                return "Error: supports grayscale, sepia, invert, blur"
+            output = _save_image(filtered, f"filter_{filter_type}", ".png")
+        return output
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def add_text_to_image(arg):
+    """Add text watermark to an image. Arg format: image.png|Hello Watermark|/tmp/out.png"""
+    try:
+        Image = _pil_image()
+        if Image is None:
+            return "Error: PIL not available"
+        raw = str(arg or "").strip()
+        parts = [p.strip() for p in raw.split("|")]
+        if len(parts) != 3:
+            return "Error: add_text_to_image needs 'image.png|text|/tmp/out.png'"
+        image_path = parts[0]
+        text = parts[1]
+        output_path = parts[2]
+        ip = _safe_path(image_path)
+        out_sp = _safe_path(output_path)
+        if ip is None or out_sp is None or not os.path.isfile(ip):
+            return "Error: image not found or bad path"
+        with Image.open(ip) as im:
+            im = im.convert("RGBA")
+            from PIL import ImageDraw, ImageFont
+            txt_layer = Image.new("RGBA", im.size, (255, 255, 255, 0))
+            draw = ImageDraw.Draw(txt_layer)
+            try:
+                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 36)
+            except Exception:
+                font = ImageFont.load_default()
+            draw.text((10, 10), text, fill=(255, 255, 255, 128), font=font)
+            combined = Image.alpha_composite(im, txt_layer).convert("RGB")
+            os.makedirs(os.path.dirname(out_sp) or ".", exist_ok=True)
+            combined.save(out_sp)
+        return out_sp
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def rotate_image(arg):
+    """Rotate an image. Arg format: image.png|90|/tmp/rotated.png"""
+    try:
+        Image = _pil_image()
+        if Image is None:
+            return "Error: PIL not available"
+        raw = str(arg or "").strip()
+        parts = [p.strip() for p in raw.split("|")]
+        if len(parts) != 3:
+            return "Error: rotate_image needs 'image.png|90|/tmp/rotated.png'"
+        image_path = parts[0]
+        degrees_str = parts[1]
+        output_path = parts[2]
+        ip = _safe_path(image_path)
+        out_sp = _safe_path(output_path)
+        if ip is None or out_sp is None or not os.path.isfile(ip):
+            return "Error: image not found or bad path"
+        try:
+            degrees = float(degrees_str)
+        except Exception:
+            return "Error: degrees must be a number"
+        with Image.open(ip) as im:
+            rotated = im.rotate(degrees, expand=True)
+            os.makedirs(os.path.dirname(out_sp) or ".", exist_ok=True)
+            rotated.save(out_sp)
+        return out_sp
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def thumbnail_image(arg):
+    """Create a thumbnail. Arg format: image.png|200|/tmp/thumb.png"""
+    try:
+        Image = _pil_image()
+        if Image is None:
+            return "Error: PIL not available"
+        raw = str(arg or "").strip()
+        parts = [p.strip() for p in raw.split("|")]
+        if len(parts) != 3:
+            return "Error: thumbnail_image needs 'image.png|max_size|/tmp/thumb.png'"
+        image_path = parts[0]
+        max_size_str = parts[1]
+        output_path = parts[2]
+        ip = _safe_path(image_path)
+        out_sp = _safe_path(output_path)
+        if ip is None or out_sp is None or not os.path.isfile(ip):
+            return "Error: image not found or bad path"
+        try:
+            max_size = int(max_size_str)
+        except Exception:
+            return "Error: max_size must be a number"
+        with Image.open(ip) as im:
+            im.thumbnail((max_size, max_size))
+            os.makedirs(os.path.dirname(out_sp) or ".", exist_ok=True)
+            im.save(out_sp)
+        return out_sp
+    except Exception as e:
+        return f"Error: {e}"
+
+
 TOOL_FUNCTIONS = {
     "list_code_files": lambda arg: list_code_files(),
     "search_code": lambda arg: search_code(arg),
@@ -8950,6 +10553,12 @@ TOOL_FUNCTIONS = {
     "set_brightness": lambda arg: set_brightness(arg),
     "system_status": lambda arg: system_status(),
     "code_status": lambda arg: code_status(),
+    "dns_lookup": lambda arg: dns_lookup(arg),
+    "ping": lambda arg: ping(*arg.split("|", 1)) if "|" in arg else ping(arg),
+    "traceroute": lambda arg: traceroute(arg),
+    "port_check": lambda arg: port_check(*arg.split("|", 1)) if "|" in arg else "Error: port_check needs host|port",
+    "my_ip": lambda arg: my_ip(),
+    "network_speed": lambda arg: network_speed(),
     # Not in TOOL_PROMPT on purpose: both are expensive per call and neither is
     # something she should reach for unprompted on a machine this slow.
     "learn": lambda arg: learn_about(arg),
@@ -8967,6 +10576,40 @@ TOOL_FUNCTIONS = {
     "gif_to_video": lambda arg: (__import__("video_commands").gif_to_video_command(*arg.split("|", 2)) if "|" in arg else (__import__("video_commands").gif_to_video_command(arg) if arg else "Error: need path")) if arg else "Error: need path",
     "video_to_gif": lambda arg: (__import__("video_commands").video_to_gif_command(*arg.split("|", 4)) if "|" in arg else (__import__("video_commands").video_to_gif_command(arg) if arg else "Error: need path")) if arg else "Error: need path",
     "video_watch": lambda arg: video_commands.video_watch_description(arg) if arg else "Error: need path",
+    "generate_password": lambda arg: generate_password(*_split_pipe(arg, 2)) if "|" in arg else generate_password(),
+    "password_strength": lambda arg: password_strength(arg),
+    "word_search": lambda arg: word_search(*arg.split("|", 1)) if "|" in arg else "Error: word_search needs text|word",
+    "text_stats": lambda arg: text_stats(arg),
+    "format_number": lambda arg: format_number(*arg.split("|", 1)) if "|" in arg else "Error: format_number needs number|decimals",
+    "read_doc": lambda arg: read_doc(arg),
+    "crypto_price": lambda arg: crypto_price(arg),
+    "sports_scores": lambda arg: sports_scores(arg),
+    "dice": lambda arg: dice(_number_arg(arg, 6)),
+    "coin_flip": lambda arg: coin_flip(),
+    "random_number": lambda arg: random_number(*_random_range(arg)),
+    "lottery_numbers": lambda arg: lottery_numbers(*_lottery_pick(arg)),
+    "ascii_art": lambda arg: ascii_art(arg),
+    "text_to_ascii": lambda arg: text_to_ascii(arg),
+    "morse_code": lambda arg: morse_code(arg),
+    "barcode": lambda arg: barcode(arg),
+    "add_event": lambda arg: add_event(*_split_pipe(arg, 3)),
+    "list_events": lambda arg: list_events(arg),
+    "countdown": lambda arg: countdown(arg),
+    "sleep_timer": lambda arg: sleep_timer(*_split_pipe(arg, 2)),
+    "generate_tone": lambda arg: generate_tone(*_split_pipe(arg, 2)),
+    "generate_scale": lambda arg: generate_scale(*_split_pipe(arg, 3)),
+    "note_to_frequency": lambda arg: note_to_frequency(arg),
+    "frequency_to_note": lambda arg: frequency_to_note(arg),
+    "create_archive": lambda arg: create_archive(arg),
+    "extract_archive": lambda arg: extract_archive(arg),
+    "list_archive": lambda arg: list_archive(arg),
+    "read_pdf": lambda arg: read_pdf(arg),
+    "pdf_to_text": lambda arg: pdf_to_text(arg),
+    "image_to_pdf": lambda arg: image_to_pdf(arg),
+    "apply_filter": lambda arg: apply_filter(arg),
+    "add_text_to_image": lambda arg: add_text_to_image(arg),
+    "rotate_image": lambda arg: rotate_image(arg),
+    "thumbnail_image": lambda arg: thumbnail_image(arg),
 }
 
 
