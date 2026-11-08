@@ -7108,6 +7108,26 @@ def move_mouse(x, y):
 def system_status():
     """Real diagnostics: what is actually running, loaded, and available."""
     parts = []
+    # Resilience telemetry: how often each backend is falling back and how
+    # long it has spent down. This is the first place to look when a hosted
+    # provider has been quietly failing over for hours.
+    try:
+        import vision_helper
+        import video_perception
+        breakers = [
+            vision_helper._FAST_PROVIDER_BREAKER,
+            video_perception._OPENAMIKA_ASR_BREAKER,
+            video_perception._OPENAMIKA_VISION_BREAKER,
+        ]
+        for breaker in breakers:
+            snap = breaker.snapshot()
+            parts.append(
+                f"{snap['name']}: {snap['successes']}/{snap['calls']} ok, "
+                f"{snap['short_circuits']} short-circuits, "
+                f"{snap['down_seconds_total']:.0f}s down"
+            )
+    except Exception:
+        pass
     # Ollama
     try:
         ready, detail = probe_ollama()

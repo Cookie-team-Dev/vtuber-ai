@@ -72,17 +72,47 @@ class CircuitBreaker:
         self.is_transient = is_transient or (lambda error: True)
         self._down_until = 0.0
         self._failures = 0
+        # Telemetry. These counters are cheap (int increments) and let the
+        # operator see how often a backend is actually falling back and how
+        # long it spent down, without wiring up a metrics backend.
+        self.calls = 0
+        self.successes = 0
+        self.failures = 0
+        self.short_circuits = 0
+        self.last_failure_at = 0.0
+        self.last_success_at = 0.0
+        self.down_seconds_total = 0.0
+        self._last_tripped_at = 0.0
 
     # -- state ----------------------------------------------------------
 
     def allow(self):
-        """True when the gate is open and the call may proceed."""
-        return time.time() >= self._down_until
+        """True when the gate is open and the call may proceed.
+
+        Side effect: counts the check as a ``call`` and, when the gate is
+        closed, as a ``short_circuit``. That is what the telemetry is for --
+        the operator can read ``short_circuits / calls`` to see how often the
+        fallback is actually being taken. When the cooldown expires the
+        elapsed down-time is rolled into ``down_seconds_total``.
+        """
+        self.calls += 1
+        now = time.time()
+        if self._down_until > 0.0 and now >= self._down_until:
+            self.down_seconds_total += self._down_until - self._last_tripped_at
+            self._down_until = 0.0
+            self._failures = 0
+        if now >= self._down_until:
+            return True
+        self.short_circuits += 1
+        return False
 
     def success(self):
         """Record a successful call: clear failures and cooldown."""
+        now = time.time()
         self._failures = 0
+        self.successes += 1
         self._down_until = 0.0
+        self.last_success_at = now
 
     def record(self, error):
         """Record a failure. Returns True if the caller should re-raise.
@@ -91,11 +121,15 @@ class CircuitBreaker:
         ``threshold`` transient failures the breaker trips and subsequent
         calls short-circuit to the fallback until the cooldown expires.
         """
+        now = time.time()
+        self.last_failure_at = now
         if not self.is_transient(error):
             return True
         self._failures += 1
+        self.failures += 1
         if self._failures >= self.threshold:
-            self._down_until = time.time() + self.cooldown_seconds
+            self._last_tripped_at = now
+            self._down_until = now + self.cooldown_seconds
             self._failures = 0
             _LOG.debug("%s circuit breaker tripped for %.0fs: %s",
                        self.name, self.cooldown_seconds, error)
@@ -137,6 +171,27 @@ class CircuitBreaker:
         if last_error is not None:
             self.record(last_error)
         raise last_error if last_error is not None else RuntimeError("no attempt made")
+
+    def snapshot(self):
+        """Return the current telemetry as a plain dict.
+
+        Cheap to call and useful for a ``/status`` endpoint or a periodic
+        log line: ``short_circuits / calls`` is the fallback rate, and
+        ``down_seconds_total`` tells you how long the backend has been out.
+        This is read-only -- it does not advance the cooldown clock, which
+        ``allow()`` is responsible for.
+        """
+        return {
+            "name": self.name,
+            "calls": self.calls,
+            "successes": self.successes,
+            "failures": self.failures,
+            "short_circuits": self.short_circuits,
+            "down_seconds_total": round(self.down_seconds_total, 2),
+            "last_failure_at": self.last_failure_at,
+            "last_success_at": self.last_success_at,
+            "open": time.time() < self._down_until,
+        }
 
 
 def transient_http_error(error):

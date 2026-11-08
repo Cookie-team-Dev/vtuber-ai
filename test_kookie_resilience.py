@@ -76,6 +76,27 @@ class CircuitBreakerTests(unittest.TestCase):
         self.assertEqual(sleep.call_count, 2)
         sleep.assert_has_calls([mock.call(0.2), mock.call(0.4)])
 
+    def test_snapshot_counts_calls_successes_and_short_circuits(self):
+        self.breaker._down_until = 1_000_000.0  # closed
+        self.breaker._last_tripped_at = 100.0
+        self.breaker.calls = 0
+        self.breaker.successes = 0
+        self.breaker.failures = 0
+        self.breaker.short_circuits = 0
+        self.breaker.down_seconds_total = 0.0
+
+        with mock.patch.object(kookie_resilience.time, "time",
+                               side_effect=[500.0, 500.0, 1_000_001.0, 1_000_001.0]):
+            self.breaker.allow()  # short-circuit
+            self.breaker.allow()  # short-circuit
+            self.breaker.allow()  # cooldown expires -> rolls down-time into total
+
+            snap = self.breaker.snapshot()
+        self.assertEqual(snap["calls"], 3)
+        self.assertEqual(snap["short_circuits"], 2)
+        self.assertEqual(snap["down_seconds_total"], 999_900.0)
+        self.assertFalse(snap["open"])
+
     def test_call_reraises_permanent_error_without_backoff(self):
         class PermanentError(Exception):
             pass

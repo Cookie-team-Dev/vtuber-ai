@@ -1280,6 +1280,23 @@ in `vts_token.txt` next to the code, so she only ever asks once.
 | `KOOKIE_HTTP_REQUEST_RETRY_DELAY_SECONDS` | `0.15` | base retry delay (exponential backoff) between shared HTTP attempts |
 | `KOOKIE_HTTP_REQUEST_RETRY_JITTER` | `0.25` | fraction of the computed delay that is randomised (0-1) so that several clients failing over at once do not retry in lockstep |
 | `KOOKIE_AMIKA_TTS_URL` | `http://127.0.0.1:8002` | OpenAmika GPT-SoVITS Socket.IO service base URL |
+
+### Resilience telemetry
+
+Every circuit breaker keeps its own counters (`calls`, `successes`,
+`failures`, `short_circuits`, `down_seconds_total`) and exposes them through
+`CircuitBreaker.snapshot()`. Kookie's `system_status` command prints one line
+per breaker, so when a hosted provider has been quietly failing over for hours
+you can see it immediately instead of guessing from slow replies:
+
+```
+fast_vision: 12/15 ok, 3 short-circuits, 0s down
+openamika_asr: 0/0 ok, 0 short-circuits, 0s down
+openamika_vision: 0/0 ok, 0 short-circuits, 0s down
+```
+
+`short_circuits / calls` is the fallback rate and `down_seconds_total` is how
+long the backend has been out since the last trip.
 | `KOOKIE_AMIKA_SPEED` | `1.2` | Amika speaking rate (`0.5`–`2.0`) |
 | `KOOKIE_KEEP_ALIVE` | `15m` | how long Ollama holds her weights in memory |
 
