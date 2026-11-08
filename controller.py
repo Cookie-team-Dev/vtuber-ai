@@ -5161,6 +5161,33 @@ def recall_memory(query, limit=6):
     return "\n".join(lines[: limit + 3])
 
 
+def forget_memory(target):
+    """Drop every stored note that mentions ``target``.
+
+    The slur filter is not consulted here - this is an explicit deletion, not
+    a storage decision, so a note that was correctly stored can still be
+    removed when the person asks her to.
+    """
+    try:
+        import memory_helper
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    removed = memory_helper.forget(target)
+    return f"Removed {removed} note(s) mentioning {target!r}."
+
+
+def memory_summary():
+    """How many notes are stored and when the last one landed."""
+    try:
+        import memory_helper
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    snap = memory_helper.summary()
+    return (
+        f"{snap['count']} note(s) stored; last one {snap['last_ago']}."
+    )
+
+
 def format_memory_note(item, max_chars=220):
     """Render one memory entry as a single prompt-friendly line."""
     text = str(item.get("text", "")).strip().replace("\n", " ")
@@ -7162,6 +7189,34 @@ def system_status():
     return "\n".join(parts) if parts else "Status unavailable"
 
 
+def audio_status():
+    """Whether speech output is on and what volume it is playing at."""
+    try:
+        import audio_helper
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    snap = audio_helper.status()
+    return f"Voice: {'on' if snap['enabled'] else 'off'}; volume {snap['volume']}."
+
+
+def set_audio_volume(level):
+    """Clamp a volume request to 0-100 and store it for the next play."""
+    try:
+        import audio_helper
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    return f"Volume set to {audio_helper.set_volume(level)}."
+
+
+def stop_audio():
+    """Halt any speech that is currently playing."""
+    try:
+        import audio_helper
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    return "Stopped." if audio_helper.stop() else "Could not stop playback."
+
+
 def code_status():
     """Overview of her own core code: files, sizes, git state, and health."""
     parts = []
@@ -8429,6 +8484,39 @@ def word_count(text):
         f"Sentences: {len(sentences)}",
         f"Paragraphs: {len(paragraphs)}",
     ])
+
+
+def truncate_text(text, max_chars=200):
+    """Cut text to a length and append an ellipsis when it was cut."""
+    try:
+        import core_utils
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    if "|" in str(text):
+        text, max_chars = str(text).rsplit("|", 1)
+        max_chars = core_utils.parse_int(max_chars, 200)
+    return core_utils.truncate(text, max_chars=max_chars)
+
+
+def slugify_text(text, max_chars=64):
+    """Turn text into a lowercase, hyphen-separated identifier."""
+    try:
+        import core_utils
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    if "|" in str(text):
+        text, max_chars = str(text).rsplit("|", 1)
+        max_chars = core_utils.parse_int(max_chars, 64)
+    return core_utils.slugify(text, max_chars=max_chars)
+
+
+def human_duration(seconds):
+    """Render a number of seconds as ``1h 2m 3s``."""
+    try:
+        import core_utils
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    return core_utils.human_seconds(seconds)
 
 
 def extract_links(text):
@@ -10648,6 +10736,8 @@ TOOL_FUNCTIONS = {
     "read_code_edits": lambda arg: read_code_edits(limit_entries=int(arg) if arg and arg.isdigit() else 5),
     "autonomous_history": lambda arg: "\n".join(get_autonomous_history()),
     "recall_memory": lambda arg: recall_memory(arg),
+    "forget_memory": lambda arg: forget_memory(arg),
+    "memory_summary": lambda arg: memory_summary(),
     "calculate": lambda arg: maths.calculate(arg),
     "math": lambda arg: maths.calculate(arg),
     "click_at": lambda arg: click_at(*[int(x) if x.isdigit() else x for x in arg.split(",")]) if "," in arg else "Error: click_at requires 'x,y'",
@@ -10706,6 +10796,12 @@ TOOL_FUNCTIONS = {
     "set_volume": lambda arg: set_volume(arg),
     "set_brightness": lambda arg: set_brightness(arg),
     "system_status": lambda arg: system_status(),
+    "audio_status": lambda arg: audio_status(),
+    "set_audio_volume": lambda arg: set_audio_volume(arg),
+    "stop_audio": lambda arg: stop_audio(),
+    "truncate_text": lambda arg: truncate_text(arg),
+    "slugify_text": lambda arg: slugify_text(arg),
+    "human_duration": lambda arg: human_duration(arg),
     "code_status": lambda arg: code_status(),
     "dns_lookup": lambda arg: dns_lookup(arg),
     "ping": lambda arg: ping(*arg.split("|", 1)) if "|" in arg else ping(arg),
