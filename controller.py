@@ -5317,6 +5317,381 @@ def skills_list():
     return "\n".join(lines)
 
 
+def second_brain_state():
+    """What the second brain is working on, in one block."""
+    try:
+        import second_brain
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    state = second_brain.get_second_brain_state()
+    return (
+        f"Second brain: {state.get('thoughts_count', 0)} thought(s), "
+        f"{state.get('active_problems', 0)} active problem(s), "
+        f"{state.get('insights_count', 0)} insight(s), "
+        f"{state.get('queued_thoughts', 0)} queued."
+    )
+
+
+def second_brain_start(topic, description):
+    """Start a multi-step problem in the second brain."""
+    try:
+        import second_brain
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    return second_brain.start_problem(str(topic).strip(), str(description).strip())
+
+
+def second_brain_insight(topic, insight, confidence=0.7):
+    """Record an insight the second brain has had."""
+    try:
+        import second_brain
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    return second_brain.add_insight(str(topic).strip(), str(insight).strip(), float(confidence))
+
+
+def vocalize(context="think", emotion="neutral"):
+    """A non-verbal vocalization for the current context and emotion."""
+    try:
+        import vocalizations
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    return vocalizations.vocalize(context=str(context).strip(), emotion=str(emotion).strip())
+
+
+def vocalization_contexts():
+    """Which contexts Kookie can make non-verbal sounds for."""
+    try:
+        import vocalizations
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    contexts = vocalizations.list_contexts()
+    if not isinstance(contexts, (list, tuple)):
+        return str(contexts)
+    return ", ".join(str(c) for c in contexts)
+
+
+def lipsync_state():
+    """Whether lip-sync is running right now and on what text."""
+    try:
+        import lipsync
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    return _stringify(lipsync.get_lipsync_state())
+
+
+def osu_status():
+    """Whether osu! automation is running and with what keys."""
+    try:
+        import osu_player
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    return _stringify(osu_player.osu_status())
+
+
+def content_filter_stats():
+    """How the content filter is configured right now."""
+    try:
+        import content_filter
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    return _stringify(content_filter.get_filter_stats())
+
+
+def amika_brain_retrieve(query, limit=3):
+    """Relevant notes from OpenAmika's evidence-retrieval layer."""
+    try:
+        import amika_brain
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    entries = get_memory()
+    try:
+        limit = int(limit) if str(limit).strip() else 3
+    except (TypeError, ValueError):
+        limit = 3
+    hits = amika_brain.retrieve_relevant_notes(str(query).strip(), entries, limit=limit)
+    if not hits:
+        return "No relevant notes found."
+    return "\n".join(str(h) for h in hits)
+
+
+def parse_speech_codes(text):
+    """Split Amika-style speech/emotion codes out of a string."""
+    try:
+        import amika_tts_codes
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    segments = amika_tts_codes.parse_speech_codes(str(text or ""))
+    if not segments:
+        return ""
+    return "\n".join(f"{seg[1] or 'neutral'}: {seg[0]}" for seg in segments)
+
+
+def filter_input_text(text):
+    """Run the content filter over a piece of user input."""
+    try:
+        import content_filter
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    return content_filter.filter_input(str(text or ""))
+
+
+def _stringify(value):
+    """Render dicts/lists/scalars as a human-readable string."""
+    if isinstance(value, dict):
+        return "\n".join(f"{k}: {v}" for k, v in value.items()) if value else "(empty)"
+    if isinstance(value, (list, tuple)):
+        return "\n".join(str(item) for item in value) if value else "(empty)"
+    return str(value)
+
+
+def monid_balance():
+    """Monid account balance."""
+    try:
+        import monid_skill
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    return _stringify(monid_skill.monid_balance())
+
+
+def monid_whoami():
+    """Who the Monid account is logged in as."""
+    try:
+        import monid_skill
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    return _stringify(monid_skill.monid_whoami())
+
+
+def monid_discover(query, limit=5):
+    """Discover Monid providers/endpoints matching a query."""
+    try:
+        import monid_skill
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    return _stringify(monid_skill.monid_discover(str(query or "").strip(), limit=int(limit) if str(limit).strip() else 5))
+
+
+def monid_runs_list(limit=10):
+    """List recent Monid runs."""
+    try:
+        import monid_skill
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    return _stringify(monid_skill.monid_runs_list(limit=int(limit) if str(limit).strip() else 10))
+
+
+def sanitize_speech(text):
+    """Strip echo/blurt/speech-control markup from a string."""
+    try:
+        import po_contract
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    return po_contract.sanitize_speech(str(text or ""))
+
+
+def strip_controls(text):
+    """Remove control characters from a string."""
+    try:
+        import po_contract
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    return po_contract.strip_controls(str(text or ""))
+
+
+def po_normalize_tag(raw):
+    """Normalise a speech/emotion tag to its canonical form."""
+    try:
+        import po_contract
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    return po_contract.normalize_tag(str(raw or ""))
+
+
+def po_resolve_emotion(tag, default="casual_neutral"):
+    """Resolve an emotion tag to a known emotion name."""
+    try:
+        import po_contract
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    return po_contract.resolve_emotion(str(tag or "").strip() or None, default=str(default or "casual_neutral"))
+
+
+def po_emotion_vocab_lines():
+    """List the emotion vocabulary as one line per emotion."""
+    try:
+        import po_contract
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    lines = po_contract.emotion_vocab_lines()
+    if isinstance(lines, (list, tuple)):
+        return "\n".join(str(line) for line in lines)
+    return _stringify(lines)
+
+
+def po_canonical_sfx(name):
+    """Canonical SFX name for a sound effect reference."""
+    try:
+        import po_contract
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    return po_contract.canonical_sfx(str(name or "").strip() or None) or "(none)"
+
+
+def po_strip_sfx(text):
+    """Strip a trailing SFX tag from a string."""
+    try:
+        import po_contract
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    return po_contract.strip_sfx(str(text or ""))
+
+
+def po_strip_echo_tail(text):
+    """Strip the echoed tail from a blurt string."""
+    try:
+        import po_contract
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    return po_contract.strip_echo_tail(str(text or ""))
+
+
+def po_blurt_threshold(blurt):
+    """How many repeated words count as a blurt."""
+    try:
+        import po_contract
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    return str(po_contract.blurt_threshold(str(blurt or "").strip() or None))
+
+
+def po_dedupe_blurt(text, blurt=None):
+    """Dedupe a blurt against a string."""
+    try:
+        import po_contract
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    return po_contract.dedupe_blurt(str(text or ""), str(blurt or "").strip() or None)
+
+
+def po_match_blurt_prefix(text, blurt=None):
+    """Match a blurt prefix against a string."""
+    try:
+        import po_contract
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    return _stringify(po_contract.match_blurt_prefix(str(text or ""), str(blurt or "").strip() or None))
+
+
+def web_key_count():
+    """How many web UI access keys are minted."""
+    try:
+        import webui
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    return str(webui.web_key_count())
+
+
+def web_keys():
+    """List the web UI access keys."""
+    try:
+        import webui
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    return _stringify(webui.web_keys())
+
+
+def video_watch_description(path, max_frames=10):
+    """Describe what a video shows, frame by frame."""
+    try:
+        import video_commands
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    try:
+        return _stringify(video_commands.video_watch_description(str(path or "").strip(), int(max_frames) if str(max_frames).strip() else 10))
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+
+
+def eval_check_answer(kind, question, answer, expected):
+    """Mechanically score one answer (contains/words/no_emoji/...)."""
+    try:
+        import eval_smart
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    kind = str(kind or "").strip()
+    question = str(question or "").strip()
+    answer = str(answer or "").strip()
+    expected = str(expected or "").strip()
+    if kind == "words":
+        try:
+            expected = int(expected)
+        except ValueError:
+            pass
+    score, note = eval_smart.check_answer(kind, question, answer, expected)
+    return f"{score}: {note}"
+
+
+def video_info(path):
+    """Probe a video file with ffprobe."""
+    try:
+        import video_tools
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    return _stringify(video_tools.get_video_info(str(path or "").strip()))
+
+
+def training_emotions():
+    """List the emotions Kookie's training data knows about."""
+    try:
+        import training_data
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    emotions = training_data.emotions()
+    if isinstance(emotions, (list, tuple)):
+        return "\n".join(str(e) for e in emotions)
+    return _stringify(emotions)
+
+
+def train_dry_run(train_path, eval_path, base_model):
+    """Everything that can be checked without a GPU, checked."""
+    try:
+        import train_smart
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    import io
+    import contextlib
+    buffer = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buffer):
+            result = train_smart.dry_run(str(train_path or "").strip(), str(eval_path or "").strip(), str(base_model or "").strip())
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    output = buffer.getvalue().strip()
+    return f"exit={result}\n{output}" if output else f"exit={result}"
+
+
+def load_rows(path):
+    """Load training rows from a JSONL file."""
+    try:
+        import train_smart
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    path = str(path or "").strip()
+    if not path:
+        return "Error: need a path"
+    import os
+    if not os.path.isfile(path):
+        return f"Error: {path} does not exist"
+    try:
+        rows = train_smart.load_rows(path)
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    if not rows:
+        return f"Error: no rows in {path}"
+    return f"{len(rows)} rows"
+
+
 # With the 16K context window, there is room for much more conversation history.
 # 16 exchanges instead of 8: a bigger model can track pronouns and references
 # across more turns, so the transcript can be longer without losing coherence.
@@ -10869,6 +11244,40 @@ TOOL_FUNCTIONS = {
     "sleep_state": lambda arg: sleep_state(),
     "skills_list": lambda arg: skills_list(),
     "web_search": lambda arg: __import__("web_search_helper").search_text(arg),
+    "second_brain_state": lambda arg: second_brain_state(),
+    "second_brain_start": lambda arg: second_brain_start(*_split_pipe(arg, 2)),
+    "second_brain_insight": lambda arg: second_brain_insight(*_split_pipe(arg, 3)),
+    "vocalize": lambda arg: vocalize(*_split_pipe(arg, 2)),
+    "vocalization_contexts": lambda arg: vocalization_contexts(),
+    "lipsync_state": lambda arg: lipsync_state(),
+    "osu_status": lambda arg: osu_status(),
+    "content_filter_stats": lambda arg: content_filter_stats(),
+    "amika_brain_retrieve": lambda arg: amika_brain_retrieve(*_split_pipe(arg, 2)),
+    "parse_speech_codes": lambda arg: parse_speech_codes(arg),
+    "filter_input_text": lambda arg: filter_input_text(arg),
+    "monid_balance": lambda arg: monid_balance(),
+    "monid_whoami": lambda arg: monid_whoami(),
+    "monid_discover": lambda arg: monid_discover(*_split_pipe(arg, 2)),
+    "monid_runs_list": lambda arg: monid_runs_list(*_split_pipe(arg, 2)) if "," in arg else monid_runs_list(),
+    "sanitize_speech": lambda arg: sanitize_speech(arg),
+    "strip_controls": lambda arg: strip_controls(arg),
+    "po_normalize_tag": lambda arg: po_normalize_tag(arg),
+    "po_resolve_emotion": lambda arg: po_resolve_emotion(*_split_pipe(arg, 2)),
+    "po_emotion_vocab_lines": lambda arg: po_emotion_vocab_lines(),
+    "po_canonical_sfx": lambda arg: po_canonical_sfx(arg),
+    "po_strip_sfx": lambda arg: po_strip_sfx(arg),
+    "po_strip_echo_tail": lambda arg: po_strip_echo_tail(arg),
+    "po_blurt_threshold": lambda arg: po_blurt_threshold(arg),
+    "po_dedupe_blurt": lambda arg: po_dedupe_blurt(*_split_pipe(arg, 2)),
+    "po_match_blurt_prefix": lambda arg: po_match_blurt_prefix(*_split_pipe(arg, 2)),
+    "web_key_count": lambda arg: web_key_count(),
+    "web_keys": lambda arg: web_keys(),
+    "video_watch_description": lambda arg: video_watch_description(*_split_pipe(arg, 2)),
+    "eval_check_answer": lambda arg: eval_check_answer(*_split_pipe(arg, 4)),
+    "video_probe": lambda arg: video_info(arg),
+    "training_emotions": lambda arg: training_emotions(),
+    "train_dry_run": lambda arg: train_dry_run(*_split_pipe(arg, 3)),
+    "load_rows": lambda arg: load_rows(arg),
     "calculate": lambda arg: maths.calculate(arg),
     "math": lambda arg: maths.calculate(arg),
     "click_at": lambda arg: click_at(*[int(x) if x.isdigit() else x for x in arg.split(",")]) if "," in arg else "Error: click_at requires 'x,y'",
