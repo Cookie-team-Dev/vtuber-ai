@@ -5188,6 +5188,32 @@ def memory_summary():
     )
 
 
+def memory_search(query, limit=5):
+    """Keyword recall over the stored notes, newest first.
+
+    Falls back to the optional semantic (vector) adapter when it is enabled,
+    otherwise uses plain substring matching.
+    """
+    try:
+        import memory_helper
+        import semantic_memory
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    adapter = semantic_memory.get_semantic_memory()
+    if adapter is not None:
+        hits = adapter.search(query, limit=limit)
+        if hits:
+            return "\n".join(
+                f"- {hit['text']} ({hit['ago']}, score {hit['score']})"
+                for hit in hits
+            )
+    matches = memory_helper.search(query, limit=limit)
+    return "\n".join(
+        f"- {m['text']} ({memory_helper._memory.format_time_ago(m['time'])})"
+        for m in matches
+    ) or "No matching notes found."
+
+
 def format_memory_note(item, max_chars=220):
     """Render one memory entry as a single prompt-friendly line."""
     text = str(item.get("text", "")).strip().replace("\n", " ")
@@ -10736,6 +10762,7 @@ TOOL_FUNCTIONS = {
     "read_code_edits": lambda arg: read_code_edits(limit_entries=int(arg) if arg and arg.isdigit() else 5),
     "autonomous_history": lambda arg: "\n".join(get_autonomous_history()),
     "recall_memory": lambda arg: recall_memory(arg),
+    "memory_search": lambda arg: memory_search(arg),
     "forget_memory": lambda arg: forget_memory(arg),
     "memory_summary": lambda arg: memory_summary(),
     "calculate": lambda arg: maths.calculate(arg),

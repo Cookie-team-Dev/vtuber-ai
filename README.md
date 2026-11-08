@@ -1297,6 +1297,22 @@ openamika_vision: 0/0 ok, 0 short-circuits, 0s down
 
 `short_circuits / calls` is the fallback rate and `down_seconds_total` is how
 long the backend has been out since the last trip.
+
+### Optional semantic memory
+
+Kookie's notes live in an append-only JSON journal (see `memory.py`). On top
+of that there is an opt-in vector layer in `semantic_memory.py`, modelled after
+the Chroma/Mem0 pattern: a small in-process index that is rebuilt from the
+journal when it falls out of sync.
+
+It is **off by default**. Set `KOOKIE_SEMANTIC_MEMORY=1` to turn it on; a
+machine without numpy still works because the adapter falls back to the keyword
+recall already in `memory_helper.search`. The embedding model is pluggable -
+the default is a deterministic bag-of-words hash, and you can pass your own
+`text -> list[float]` callable to the `SemanticMemory` constructor.
+
+The `memory_search` tool uses the adapter when it is enabled and transparently
+falls back to substring matching otherwise, so the tool surface does not change.
 | `KOOKIE_AMIKA_SPEED` | `1.2` | Amika speaking rate (`0.5`–`2.0`) |
 | `KOOKIE_KEEP_ALIVE` | `15m` | how long Ollama holds her weights in memory |
 
