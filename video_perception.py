@@ -18,12 +18,19 @@ models are loaded the first time she needs them and then kept:
 Mommy said she does not care how much they eat.
 """
 
+import base64
 import gc
+import json
+import logging
 import os
 import shutil
 import subprocess
 import tempfile
 import time
+import urllib.error
+import urllib.request
+
+import kookie_resilience
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _MODELS_DIR = os.path.join(_HERE, "models")
@@ -64,6 +71,137 @@ _WHISPER = None
 _CLIP = None
 _OCR = None
 _GALLERY = None
+_LOG = logging.getLogger(__name__)
+_OPENAMIKA_ASR_URL = os.environ.get(
+    "KOOKIE_OPENAMIKA_ASR_URL", "http://127.0.0.1:53000"
+).rstrip("/") + "/api/v1/asr"
+_OPENAMIKA_VISION_URL = os.environ.get(
+    "KOOKIE_OPENAMIKA_VISION_URL", "http://127.0.0.1:8014"
+).rstrip("/") + "/api/describe"
+
+
+def _openamika_backend_cooldown_seconds():
+    try:
+        seconds = float(os.environ.get("KOOKIE_OPENAMIKA_BACKEND_COOLDOWN_SECONDS", "20"))
+    except (TypeError, ValueError):
+        seconds = 20.0
+    return max(0.0, seconds)
+
+
+def _openamika_backend_retry_attempts():
+    try:
+        attempts = int(os.environ.get("KOOKIE_OPENAMIKA_BACKEND_RETRY_ATTEMPTS", "1"))
+    except (TypeError, ValueError):
+        attempts = 1
+    return max(1, attempts)
+
+
+def _openamika_backend_retry_delay_seconds():
+    try:
+        seconds = float(os.environ.get("KOOKIE_OPENAMIKA_BACKEND_RETRY_DELAY_SECONDS", "0.15"))
+    except (TypeError, ValueError):
+        seconds = 0.15
+    return max(0.0, seconds)
+
+
+def _openamika_backend_failure_threshold():
+    try:
+        threshold = int(os.environ.get("KOOKIE_OPENAMIKA_BACKEND_FAILURE_THRESHOLD", "1"))
+    except (TypeError, ValueError):
+        threshold = 1
+    return max(1, threshold)
+
+
+_OPENAMIKA_BACKEND_COOLDOWN_SECONDS = _openamika_backend_cooldown_seconds()
+_OPENAMIKA_BACKEND_RETRY_ATTEMPTS = _openamika_backend_retry_attempts()
+_OPENAMIKA_BACKEND_RETRY_DELAY_SECONDS = _openamika_backend_retry_delay_seconds()
+_OPENAMIKA_BACKEND_FAILURE_THRESHOLD = _openamika_backend_failure_threshold()
+_OPENAMIKA_ASR_BREAKER = kookie_resilience.CircuitBreaker(
+    "openamika_asr",
+    cooldown_seconds=_OPENAMIKA_BACKEND_COOLDOWN_SECONDS,
+    attempts=_OPENAMIKA_BACKEND_RETRY_ATTEMPTS,
+    delay_seconds=_OPENAMIKA_BACKEND_RETRY_DELAY_SECONDS,
+    threshold=_OPENAMIKA_BACKEND_FAILURE_THRESHOLD,
+    is_transient=kookie_resilience.default_is_transient,
+)
+_OPENAMIKA_VISION_BREAKER = kookie_resilience.CircuitBreaker(
+    "openamika_vision",
+    cooldown_seconds=_OPENAMIKA_BACKEND_COOLDOWN_SECONDS,
+    attempts=_OPENAMIKA_BACKEND_RETRY_ATTEMPTS,
+    delay_seconds=_OPENAMIKA_BACKEND_RETRY_DELAY_SECONDS,
+    threshold=_OPENAMIKA_BACKEND_FAILURE_THRESHOLD,
+    is_transient=kookie_resilience.default_is_transient,
+)
+# Keep local ASR requests bounded so malformed or unexpectedly large recordings
+# cannot consume the whole process before the network timeout applies.
+_MAX_OPENAMIKA_AUDIO_BYTES = int(
+    os.environ.get("KOOKIE_MAX_OPENAMIKA_AUDIO_MB", "64")
+) * 1024 * 1024
+
+
+def _transcribe_openamika(wav_path, timeout=90):
+    """Use OpenAmika's multilingual local ASR when its speech service is running."""
+    try:
+        audio_size = os.path.getsize(wav_path)
+        if audio_size > _MAX_OPENAMIKA_AUDIO_BYTES:
+            _LOG.warning(
+                "Skipping OpenAmika ASR for oversized audio (%d bytes; limit %d)",
+                audio_size,
+                _MAX_OPENAMIKA_AUDIO_BYTES,
+            )
+            return None
+        with open(wav_path, "rb") as audio_file:
+            audio = audio_file.read(_MAX_OPENAMIKA_AUDIO_BYTES + 1)
+    except OSError as error:
+        _LOG.warning("Could not read audio for OpenAmika ASR: %s", error)
+        return None
+    if len(audio) > _MAX_OPENAMIKA_AUDIO_BYTES:
+        _LOG.warning("Skipping OpenAmika ASR for oversized audio payload")
+        return None
+
+    boundary = "----KookieOpenAmikaASRBoundary"
+    parts = [
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="files"; filename="kookie-audio.wav"\r\n'
+        "Content-Type: audio/wav\r\n\r\n".encode("ascii"),
+        audio,
+        (
+            f"\r\n--{boundary}\r\n"
+            'Content-Disposition: form-data; name="lang"\r\n\r\nauto'
+            f"\r\n--{boundary}--\r\n"
+        ).encode("ascii"),
+    ]
+    request = urllib.request.Request(
+        _OPENAMIKA_ASR_URL,
+        data=b"".join(parts),
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+
+    if not _OPENAMIKA_ASR_BREAKER.allow():
+        _LOG.debug("OpenAmika ASR temporarily disabled after recent failures")
+        return None
+
+    def _do_asr_request():
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    try:
+        payload = _OPENAMIKA_ASR_BREAKER.call(_do_asr_request)
+    except (OSError, urllib.error.URLError, TimeoutError, ValueError) as error:
+        _LOG.debug("OpenAmika ASR unavailable; using local Whisper fallback: %s", error)
+        return None
+
+    results = payload.get("result") if isinstance(payload, dict) else None
+    if not isinstance(results, list):
+        _LOG.warning("OpenAmika ASR returned an unexpected response shape")
+        return None
+    text = " ".join(
+        str(item.get("clean_text") or item.get("text") or "").strip()
+        for item in results
+        if isinstance(item, dict)
+    ).strip()
+    return text or None
 
 
 def memory_available_mb():
@@ -1221,6 +1359,51 @@ def describe_images(images):
     )
 
 
+def describe_image_file(path):
+    """Use OpenAmika's local VLM when available, otherwise Kookie's local vision stack."""
+    try:
+        with open(path, "rb") as image_file:
+            image_bytes = image_file.read(10_000_001)
+    except OSError as error:
+        return f"She could not read that picture: {error}"
+    if len(image_bytes) > 10_000_000:
+        return "That picture is too large to analyze (maximum 10 MB)."
+
+    payload = json.dumps({
+        "image": base64.b64encode(image_bytes).decode("ascii"),
+        "prompt": "Describe the main subject, action and setting in one or two concise English sentences.",
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        _OPENAMIKA_VISION_URL,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    if not _OPENAMIKA_VISION_BREAKER.allow():
+        _LOG.debug("OpenAmika vision temporarily disabled after recent failures")
+    else:
+        def _do_vision_request():
+            with urllib.request.urlopen(request, timeout=90) as response:
+                return json.loads(response.read().decode("utf-8"))
+
+        try:
+            result = _OPENAMIKA_VISION_BREAKER.call(_do_vision_request)
+            description = result.get("description") if isinstance(result, dict) else None
+            if isinstance(description, str) and description.strip() and result.get("ok") is True:
+                return description.strip()
+            _LOG.debug("OpenAmika vision returned no usable description")
+        except (OSError, urllib.error.URLError, TimeoutError, ValueError) as error:
+            _LOG.debug("OpenAmika vision unavailable; using Kookie's local vision stack: %s", error)
+
+    try:
+        from PIL import Image
+
+        with Image.open(path) as source:
+            return describe_images([source.convert("RGB")])
+    except (OSError, ValueError) as error:
+        return f"She could not open that picture: {error}"
+
+
 # ----------------------------- ears -----------------------------
 
 
@@ -1324,6 +1507,9 @@ def _load_audio_f32(wav_path):
 
 def transcribe(wav_path, seconds=_WHISPER_SECONDS, deadline=240.0):
     """What is said out loud, or None when speech recognition is unavailable."""
+    openamika_text = _transcribe_openamika(wav_path)
+    if openamika_text:
+        return openamika_text
     model = _whisper_model()
     if not model:
         return None

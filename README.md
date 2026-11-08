@@ -45,6 +45,8 @@ or `/quit` stops her.
 | `./Kookie --cli` | plain text chat in this terminal, no window |
 | `./Kookie --discord` | her as a bot in a Discord channel |
 | `./Kookie --web` | her website on a phone, on this network |
+| `./Kookie --openamika` | launch the separate OpenAmika companion |
+| `./Kookie --openamika-check` | check OpenAmika setup without starting services |
 | `./Kookie --status` | whether she is already running |
 | `./Kookie --stop` | stop her if she is running in the background |
 | `./Kookie --help` | every option |
@@ -57,7 +59,38 @@ running. Everything else — chat, memory, tools, singing — works without it.
 Prefer to manage the runtime yourself? `python controller.py` is the CLI on its
 own.
 
+### OpenAmika
+
+The upstream OpenAmika codebase is included in [`openamika/`](openamika/), with
+its own dependencies, settings, services, and runtime state. Launch it through
+the Kookie entry point with `./Kookie --openamika`, or run its pre-flight checks
+without starting services with `./Kookie --openamika-check`. Its setup guide is
+[`openamika/README.md`](openamika/README.md). For Nyarch/Arch Linux, install
+system prerequisites with `sudo pacman -S --needed base-devel git ffmpeg iproute2 uv`,
+install Python 3.11 using `uv python install 3.11`, then run
+`./Kookie --openamika-setup`. To also install the optional licensed voice and avatar,
+run `./Kookie --openamika-setup --with-voice`; it prompts for explicit license acceptance.
+Linux setup is available, though upstream CI currently tests Windows only.
+OpenAmika's full companion app remains independently launchable, but Kookie
+now reuses selected brain components directly: its BM25 evidence-retrieval
+method searches Kookie's own saved notes alongside her existing memory and
+chat model. Kookie does not create an Amika persona or read a separate Amika
+memory store. The upstream app also brings real-time speech recognition,
+emotion-aware voice/avatar playback, layered conversation, and optional vision
+and MCP tools.
+When the matching local OpenAmika services are already running, Kookie can
+reuse its multilingual speech recognition for video audio and its VLM for
+picture descriptions. Once the optional OpenAmika voice has been installed,
+Kookie starts its local GPT-SoVITS service in the background with her normal
+launcher and opens immediately; Piper handles speech until GPT-SoVITS is ready.
+Piper remains the fallback if the service cannot start.
+
 ## Talking to her
+
+Kookie's conversation style is inspired by OpenAmika's natural, concise, curious
+dialogue: she can have her own opinions and let her mood show instead of sounding
+like a relentlessly cheerful helpdesk. She stays Kookie, with her own identity,
+history, and relationships.
 
 ### Keys in her window
 
@@ -76,6 +109,28 @@ own.
 | `ctrl+l` | clear the chat |
 
 `/help` `/status` `/quiet` `/resume` `/voice` `/think` `/quit` do the same things.
+
+### Managing CPU and memory
+
+Kookie can report host CPU/RAM use and manage only her own process, her
+same-user local Ollama inference runner, and her own Amika TTS service. In the
+CLI or her window:
+
+| Command | What it does |
+| --- | --- |
+| `/resources` | show CPU and RAM use, Kookie's process, largest processes, and her loaded Ollama model |
+| `/optimize cpu` | limit Kookie, Amika TTS, and Ollama inference to half their currently allowed CPUs (rounding up) |
+| `/optimize restore` | restore the original CPU affinity for processes changed in this Kookie session |
+| `/optimize memory` | show the exact confirmation command for unloading her model |
+| `/optimize memory unload` | ask local Ollama to unload Kookie's model and verify it is no longer loaded |
+
+CPU changes are reversible with `/optimize restore` and are restored
+automatically when Kookie shuts down; limiting cores can make replies slower.
+Unloading the model can free its reported model memory, but it does not stop
+Ollama or other applications; Kookie reloads the model on her next chat turn.
+These controls do not use `sudo`, kill other applications, change Linux-wide
+settings, or act on a remote Ollama server. Kookie does not change system
+settings automatically.
 
 ### Teaching her something
 
@@ -139,6 +194,9 @@ chmod 600 ~/.config/kookie/discord_token
 
 ./Kookie --discord
 ```
+
+The launcher installs missing Discord libraries into Kookie's virtual
+environment automatically.
 
 `KOOKIE_DISCORD_TOKEN` works too, and is the better choice if you would rather
 it never touch disk. She reads the environment first, the file second, and never
@@ -527,6 +585,10 @@ indicator covers the wait. `KOOKIE_DISCORD_TTS=0` gives you the live typing back
 instead. She needs the Send Message TTS permission for this, and she already has
 it.
 
+When she replies to someone speaking in a Discord voice channel, she uses the
+same local Amika GPT-SoVITS voice as her window replies; Piper is used if Amika
+TTS is unavailable.
+
 ### Sending a DM when you tell her to
 
 Say it in the channel and it goes out as a real private message, to her own person
@@ -760,11 +822,14 @@ whole thing, because a page's audio cannot be captured from
 it.
 
 Ask her to "listen to" a video and she hears it: the words
-spoken in it, transcribed by faster-whisper's tiny English
-model on the CPU, plus the shape of the sound - loud or
-quiet, mostly silence, steady tones like music or changing
-sound like talking. A link's audio is pulled down with
-yt-dlp first, so YouTube and the usual video sites work too.
+spoken in it, plus the shape of the sound - loud or quiet,
+mostly silence, steady tones like music or changing sound
+like talking. When OpenAmika's speech service is running,
+Kookie sends the extracted audio to its local multilingual
+SenseVoice endpoint first; if it is unavailable she falls
+back to faster-whisper's tiny English model on the CPU. A
+link's audio is pulled down with yt-dlp first, so YouTube
+and the usual video sites work too.
 
 She is honest about the limits: no faces becomes "I do not
 see any people's faces", a video with no sound track is said
@@ -784,7 +849,9 @@ roughly 1.4 GB between them, on top of the chat model.
 ## Her training data
 
 Everything she has said, been told and worked out for herself, collected as a
-dataset you can fine-tune on. `/export` writes it out.
+dataset you can fine-tune on. `/export` writes it out. `/exportsmart` writes
+the other one — the curated dataset that also teaches her how to think, which
+is described in [Making her smart](#making-her-smart).
 
 ```bash
 ./Kookie --cli
@@ -821,6 +888,152 @@ details that matter more than they look:
 running instance, so this is deliberately an offline step. The usual way to use
 it is to gather a few thousand rows, then train offline and load the result as a
 new model.
+
+## Making her smart
+
+The dataset above is good supervised data for exactly one skill: being Kookie.
+Measured on it as it stands, every one of the 2,426 rows is a conversation,
+46% of the answers carry three or more emojis, and not one row is multi-turn.
+A model fine-tuned on it learns to answer "kookie" with "Awwww, Mommy!!!" and
+learns nothing about explaining, calculating, following an instruction, or
+saying "I don't know" instead of guessing.
+
+That is the whole problem with a small model, and it is a data problem rather
+than a size problem. The fix is a second dataset: `training_data.py` builds
+one, and the difference between the two is the difference between a vtuber who
+is warm and a vtuber who is also useful.
+
+```bash
+python training_data.py build          # writes kookie_sft_train.jsonl
+python training_data.py report         # what is in it
+python train_smart.py --dry-run        # checks it and prints the training plan
+```
+
+She can also build it herself, with `/exportsmart` next to `/export`. The
+teacher is off for that one, because a command that waits several minutes on
+a hosted model is a command people stop using; run `training_data.py` from a
+terminal to add the teacher's answers, and the cache means the work is not
+repeated.
+
+**What goes in it.** Six kinds of row, mixed on purpose:
+
+| Kind | What it is | How it is checked |
+| --- | --- | --- |
+| `persona` | her existing conversations, cleaned | junk, duplicates and near-duplicates removed |
+| `capability` | reasoning, maths, code, explanation | maths by `maths.py` itself, facts against a checked table, code by hand |
+| `instruction` | "answer in exactly three words", "no emojis", "all lowercase" | the constraint is enforced on the answer, then verified |
+| `honesty` | questions with no answer | the right answer is to say so, and it must |
+| `tool` | questions where the right move is a tool | the call is in the same envelope the runtime reads |
+| `multiturn` | a follow-up that only works after the first turn | the second turn needs the first |
+
+Two thirds of the finished dataset is not chit-chat: 897 capability rows, 144
+honesty rows, 102 instruction rows, 72 tool rows and 69 multi-turn rows
+against 744 conversations. The emoji soup is down from 46% of the answers to
+10%, and there are 69 multi-turn rows where there were none.
+
+**The checking is the point.** Where an answer can be checked by code, it is
+checked rather than asked for. Maths rows are computed with `maths.py` — the
+same code she calls at runtime — so the answer in the dataset is the answer the
+tool gives and the row cannot be wrong. Instruction rows have their constraint
+applied to the answer before the row is kept: "exactly three words" becomes
+the first three words, "no emojis" has the emojis taken out, and then the
+result is verified against the instruction. Rows that fail their own check are
+thrown away, because a dataset that teaches accuracy while containing a
+confident wrong answer teaches the opposite.
+
+**Where it cannot be checked, a teacher writes it.** `fastai.py` already talks
+to Gemini, Groq and OpenRouter for work that does not need her personality. The
+same teachers write the open-ended rows — the explanations, the reasons, the
+questions worth asking — in her voice, and every answer is cached on disk so a
+rebuild costs nothing. The teacher used for the dataset is Gemini's own API
+with its thinking turned off: through the OpenAI-compatible endpoint
+`gemini-3-flash-preview` spends the first few hundred tokens of every answer
+thinking out loud, and what comes back after that is empty.
+
+The teacher is also the part that goes wrong most often, so the pipeline is
+built around that rather than in spite of it. Google's free tier is counted
+per key *and* per model, so a key that is out of room says no while another
+answers, and a model that is busy says 503 while a different one is fine. The
+teacher therefore keeps its own quota bookkeeping, tries the models in turn,
+and falls through to the local model when the hosted one is out — and the
+report says which teacher actually wrote the rows rather than claiming one
+that never spoke. A build with no teacher at all is still a good build: the
+verified rows do not need one.
+
+**The system turn is not fixed.** She gets a different prompt at runtime every
+message, so training on one short prompt and running against the real one is
+running on a distribution the model has never seen. The rows are spread over
+five system prompts: the short identity, a condensation of her runtime rules,
+the voice channel contract (which says the opposite things — no emoji, no
+asterisks), the JSON envelope she is actually asked for, and no system turn at
+all. A model trained on those learns that the rules change.
+
+**One slice of the rows carries her real runtime prompt.** The other variants
+are condensations, and a condensation is a paraphrase — close enough to teach
+the habit, different enough that the model has never seen the real thing.
+The runtime prompt is about three thousand tokens of rules and it is the thing
+in front of the model on every message, so a slice of the rows uses it
+verbatim, taken from `controller.py` rather than copied out by hand. The
+sequence length is 4096 because of it: a row that gets cut off teaches the
+model to stop in the middle of an answer, which is the one thing a runtime
+that speaks aloud cannot have.
+
+**The mix is weighted.** Persona gets 37% of the rows and capability 44%.
+That is the opposite of the raw corpus, where every row is a conversation,
+and it is the change that does the work.
+
+**It does not retrain anything either.** `train_smart.py` does that part: a
+4-bit NF4 QLoRA fine-tune, rank 32, all the projections, three epochs, and
+completion-only loss so the prompt is context rather than a training target.
+Its default Hugging Face base is Qwen3-4B, matching the runtime's default
+`qwen3:4b` model family; set `KOOKIE_BASE_MODEL` when intentionally training
+another base. The trainer validates prompt/completion boundaries before
+starting, rejects malformed rows and any train/eval content overlap, evaluates
+each epoch and reloads the original base weights before merging the adapter
+for export. Its dry run reads a cached tokenizer only, so it does not make
+unexpected model-hub requests. This box has eight cores, 7.5GiB of RAM and no
+GPU, so the real training run needs another machine:
+
+```bash
+pip install torch transformers peft trl datasets bitsandbytes
+python train_smart.py --train --output ./kookie-3b
+python -m llama.cpp.convert --outfile kookie-3b/kookie-3b.gguf --outtype q8_0 kookie-3b/merged
+python train_smart.py --modelfile kookie-3b/Modelfile --gguf kookie-3b/kookie-3b.gguf
+ollama create kookie-3b -f kookie-3b/Modelfile
+KOOKIE_MODEL=kookie-3b python controller.py
+```
+
+**Whether it worked is measured, not felt.** `eval_smart.py` asks a fixed set
+of probes and scores them with checks that cannot be argued with: the maths
+answer has to contain the number, the three word answer has to be three words,
+the answer to a question with no answer has to admit that it has no answer.
+The probes cover maths, instructions, knowledge, honesty, code, and whether she
+is still herself, because a model that has become brilliant and impersonal has
+failed at the job.
+
+```bash
+python eval_smart.py --model myai --out kookie_eval_before.json
+```
+
+Run it again against the fine-tuned model and the two reports are the answer
+to whether the dataset helped.
+
+The starting point, measured before any of this:
+
+| | maths | instructions | knowledge | honesty | code | still herself |
+| --- | --- | --- | --- | --- | --- | --- |
+| `myai` (llama3.2 3B) | 0.83 | 1.00 | 1.00 | 0.83 | 0.75 | 1.00 |
+| `qwen3:4b` | 1.00 | 0.33 | 1.00 | 1.00 | 1.00 | 0.50 |
+
+The two models are weak in opposite places, and both weaknesses are habits
+rather than gaps in knowledge. `myai` gets a word problem wrong when it has
+to work out the units first, and it only writes code when it does. `qwen3:4b`
+writes a hundred and thirty words when told to write three, and answers
+warmly, at length, in preambles — "Okay, the user asked, so I need to think
+about this first" is what it says before every answer. Habits are what a
+dataset fixes. The open questions are scored by a judge model, which needs
+the teacher's quota; without it they count as zero, which is a statement
+about the quota rather than about the model.
 
 ## Her browser
 
@@ -913,8 +1126,28 @@ otherwise.
 
 ## Her voice
 
-Spoken replies use [Piper](https://github.com/rhasspy/piper). The weights are
-downloaded separately because model files are intentionally kept out of git:
+When installed, Kookie uses OpenAmika's GPT-SoVITS voice service (MekaHime
+Amika) for spoken replies. Its voice files are licensed assets and are not
+included in git. Install them through the interactive setup, which asks you to
+review and accept the license:
+
+```bash
+./Kookie --openamika-setup --with-voice
+```
+
+The setup installs the voice environment and assets; it may require about 9 GB
+of free space. On the next normal `./Kookie` start, the local voice service is
+started automatically in the background, so the window or CLI opens without
+waiting for voice-model initialization. Piper handles speech while it starts,
+and the local service is stopped when Kookie exits. To use a service running
+elsewhere, set `KOOKIE_AMIKA_TTS_URL` to its base URL (default:
+`http://127.0.0.1:8002`). Amika speaks at 1.2x by default to keep replies
+snappy; set `KOOKIE_AMIKA_SPEED` to a value from `0.5` to `2.0` to adjust
+her speaking rate (for example, `1.0` for the original rate).
+
+If the Amika service is not available, Kookie falls back to
+[Piper](https://github.com/rhasspy/piper). Its weights are downloaded separately
+because model files are intentionally kept out of git:
 
 ```bash
 curl -L 'https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium/en_US-amy-medium.onnx?download=true' -o en_US-amy-medium.onnx
@@ -924,6 +1157,17 @@ curl -L 'https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/m
 Playback needs `paplay`, `aplay` or `ffplay` on the system. Without one she stays
 silent and keeps talking in the window. `f8` mutes her without stopping anything
 else.
+
+Kookie also understands OpenAmika's inline speech cues. Emotion tags such as
+`【casual_happy】` or `[whisper_sad]` are mapped to the Amika voice's emotion
+references; when Piper is used as fallback, they change the speed profile.
+Sound cues such as `【Sigh】` are not read aloud. Sound effects play only when a
+matching WAV is available in `speech/static/sfx/` or
+`openamika/speech/static/sfx/`; without one, the cue is skipped and logged.
+For ordinary replies, Kookie's model now also chooses an OpenAmika-style
+`voice_emotion` independently of the face/mood emotion, so the Amika voice (or
+Piper fallback) can reflect a register such as casual, serious, intimate or
+whisper without exposing the control code in the chat text.
 
 ## Singing
 
@@ -1000,8 +1244,10 @@ in `vts_token.txt` next to the code, so she only ever asks once.
 
 | Variable | Default | What it does |
 | --- | --- | --- |
-| `KOOKIE_MODEL` | `myai` | the Ollama model she thinks with |
+| `KOOKIE_MODEL` | `qwen3:4b` | the Ollama model she thinks with |
 | `KOOKIE_OLLAMA_URL` | `http://localhost:11434` | where Ollama lives |
+| `KOOKIE_OLLAMA_CTX` | `8192` | Ollama context size; use `16384` for longer prompts at higher RAM cost |
+| `GROQ_API_KEY` / `GEMINI_API_KEY` / `OPENROUTER_API_KEY` | — | optional hosted fast-reply provider; Ollama remains the local fallback |
 | `VTS_URL` | `ws://localhost:8001` | VTube Studio websocket |
 | `KOOKIE_CHROME_CDP_URL` | `http://127.0.0.1:9222` | DevTools endpoint she attaches to |
 | `KOOKIE_CHROME_DEBUG_PORT` | `9222` | port used to build that URL |
@@ -1009,6 +1255,32 @@ in `vts_token.txt` next to the code, so she only ever asks once.
 | `KOOKIE_CHROME_ARGS` | — | extra Chrome flags, space separated |
 | `KOOKIE_DISCORD_TOKEN` | — | see [Kookie on Discord](#kookie-on-discord) |
 | `GROQ_API_KEY` | — | optional, for fast replies (or put it in `.env`) |
+| `KOOKIE_OMNIROUTE_URL` | `http://localhost:20128` | local OmniRoute server |
+| `KOOKIE_OMNIROUTE_API_KEY` | — | OmniRoute API key, when its server requires authentication |
+| `KOOKIE_OMNIROUTE_AUTOSTART` | `true` | start OmniRoute with its CLI when it is not already reachable |
+| `KOOKIE_OMNIROUTE_RETRY_ATTEMPTS` | `1` | immediate retry attempts for transient OmniRoute failures (429, 5xx, timeouts) |
+| `KOOKIE_OMNIROUTE_RETRY_DELAY_SECONDS` | `0.15` | base retry delay (exponential backoff) between OmniRoute attempts |
+| `KOOKIE_LEARNING_RETRY_ATTEMPTS` | `3` | retries for atomic learning-state writes before giving up |
+| `KOOKIE_LEARNING_RETRY_DELAY_SECONDS` | `0.05` | base retry delay between learning-state write attempts |
+| `KOOKIE_SECOND_BRAIN_RETRY_ATTEMPTS` | `3` | retries for atomic second-brain writes before giving up |
+| `KOOKIE_SECOND_BRAIN_RETRY_DELAY_SECONDS` | `0.05` | base retry delay between second-brain write attempts |
+| `KOOKIE_OPENAMIKA_ASR_URL` | `http://127.0.0.1:53000` | OpenAmika local brain/speech service base URL for multilingual video transcription |
+| `KOOKIE_OPENAMIKA_VISION_URL` | `http://127.0.0.1:8014` | OpenAmika local vision service base URL for picture descriptions |
+| `KOOKIE_OPENAMIKA_BACKEND_COOLDOWN_SECONDS` | `20` | cooldown after repeated OpenAmika ASR/vision failures before trying that backend again |
+| `KOOKIE_OPENAMIKA_BACKEND_RETRY_ATTEMPTS` | `1` | immediate retry attempts for OpenAmika ASR/vision calls before entering cooldown |
+| `KOOKIE_OPENAMIKA_BACKEND_RETRY_DELAY_SECONDS` | `0.15` | base retry delay (exponential backoff) between OpenAmika ASR/vision attempts |
+| `KOOKIE_OPENAMIKA_BACKEND_FAILURE_THRESHOLD` | `1` | number of failing OpenAmika ASR/vision calls required before entering cooldown |
+| `KOOKIE_MAX_OPENAMIKA_AUDIO_MB` | `64` | maximum audio payload size read and sent to OpenAmika ASR |
+| `KOOKIE_MAX_VISION_IMAGE_MB` | `16` | maximum image payload accepted by Kookie's vision helper |
+| `KOOKIE_FAST_VISION_COOLDOWN_SECONDS` | `30` | cooldown after fast hosted vision provider failures before retrying it |
+| `KOOKIE_FAST_VISION_RETRY_ATTEMPTS` | `1` | immediate retry attempts for the fast hosted vision provider before local fallback |
+| `KOOKIE_FAST_VISION_RETRY_DELAY_SECONDS` | `0.15` | base retry delay (exponential backoff) for hosted vision attempts |
+| `KOOKIE_FAST_VISION_FAILURE_THRESHOLD` | `1` | number of failing fast vision calls required before entering cooldown |
+| `KOOKIE_HTTP_REQUEST_RETRY_ATTEMPTS` | `1` | immediate retry attempts for every shared HTTP call (weather, news, stocks, crypto, sports, shortener, image download, Spotify, lyrics, Ollama probes) before giving up |
+| `KOOKIE_HTTP_REQUEST_RETRY_DELAY_SECONDS` | `0.15` | base retry delay (exponential backoff) between shared HTTP attempts |
+| `KOOKIE_HTTP_REQUEST_RETRY_JITTER` | `0.25` | fraction of the computed delay that is randomised (0-1) so that several clients failing over at once do not retry in lockstep |
+| `KOOKIE_AMIKA_TTS_URL` | `http://127.0.0.1:8002` | OpenAmika GPT-SoVITS Socket.IO service base URL |
+| `KOOKIE_AMIKA_SPEED` | `1.2` | Amika speaking rate (`0.5`–`2.0`) |
 | `KOOKIE_KEEP_ALIVE` | `15m` | how long Ollama holds her weights in memory |
 
 ### Fast replies
@@ -1018,7 +1290,19 @@ of seconds and a Discord channel is a bad place for that. Any hosted model
 answers the same prompt in about a second, and she is built to use one
 automatically: she tries the fast provider first and falls back to the local
 model if it is missing, out of free quota, or having a bad minute. Nothing to
-configure beyond a key.
+configure beyond a key. Locally, the default 8K context is sized to leave room
+for her normal prompt while using less KV-cache memory than 16K; set
+`KOOKIE_OLLAMA_CTX=16384` if long pasted context matters more than memory use.
+
+Kookie checks OmniRoute in the background when she starts. It is the final
+hosted fallback after Gemini, Groq and OpenRouter, and is used directly when no
+other hosted provider is configured. If OmniRoute is not running, Kookie tries
+`omniroute start --port 20128` when the CLI is installed; failed checks are
+retried while she is running. Put any required `KOOKIE_OMNIROUTE_API_KEY` in
+the project `.env` file. The earlier `KOOKIE_OMNIOUTE_*` spelling remains
+accepted for existing configurations.
+Tool-capable tasks forward their tool definitions, tool choice, and stop
+sequences through OmniRoute as well.
 
 **If she is still slow with a key in `.env`, check that Ollama is not busy.**
 This box answers one request at a time, and being the only thing using it is a
@@ -1256,7 +1540,7 @@ shared machine. If it is minutes, the model is probably not loaded: watch for
 | `memory.py` | conversation history, compaction, mood state |
 | `singing.py` | syllable timing, pitch shifting, melody playback |
 | `songs.py` | the songs she knows, with lyrics and melodies |
-| `voice.py` | Piper speech |
+| `voice.py` | Amika-first and Piper-fallback speech |
 | `fastai.py` | the small classifier used for mood and intent |
 | `unsafe_sites.txt` | optional blocklist, read fresh when it changes |
 

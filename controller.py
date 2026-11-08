@@ -25,9 +25,14 @@ from zoneinfo import ZoneInfo
 import requests
 import websocket
 
+import kookie_resilience
 import songs
 import fastai
 import learning
+from amika_brain import retrieve_relevant_notes
+import system_optimizer
+from amika_tts_codes import VALID_EMOTIONS as AMIKA_VOICE_EMOTIONS
+from amika_tts_codes import normalize_voice_emotion
 
 # Persistent HTTP session for connection pooling (reduces TCP handshake overhead)
 _HTTP_SESSION = requests.Session()
@@ -298,14 +303,15 @@ OLLAMA_LOAD_TIMEOUT = 240
 # Kookie plus another session's load generators: those requests timed out at 300 s
 # under that contention and the timeout was misread as a limit.
 # Her assembled prompt measures about 1500 tokens (system ~1437, memory ~253,
-# mood/time/message tail ~216 in the original measurement), so a 2048 window left
-# roughly 80 tokens for the whole reply - not enough for a sentence plus the
-# envelope fields. Ollama stopped mid-answer, the JSON never closed, and every
-# message came back as one of her "I'm honestly torn on how to respond" lines.
-# 4096 is used because it is measured to work and gives the prompt room to grow
-# into (a pasted code file, a screen description, a long message) before trimming
-# has to touch anything.
-OLLAMA_CTX = 16384
+# mood/time/message tail ~216 in the original measurement), so 8192 leaves room
+# for normal conversation while reducing KV-cache memory on a small machine.
+# Set KOOKIE_OLLAMA_CTX=16384 when unusually long pasted context matters more
+# than memory use. The value is shared by every Ollama request so its prompt
+# cache stays reusable.
+OLLAMA_CTX = int(os.environ.get("KOOKIE_OLLAMA_CTX", "8192"))
+if OLLAMA_CTX <= REPLY_TOKEN_BUDGET + 32:
+    raise ValueError(
+        "KOOKIE_OLLAMA_CTX must exceed the reply token budget plus 32 tokens")
 # What the prompt itself may use, in tokens, leaving REPLY_TOKEN_BUDGET free inside
 # OLLAMA_CTX. Enforced by trim_prompt_to_budget() rather than trusted to the prose
 # staying short, because nothing warned when the prompt outgrew the window: Ollama
@@ -369,6 +375,7 @@ OLLAMA_REPLY_SCHEMA = {
     "type": "object",
     "properties": {
         "emotion": {"type": "string"},
+        "voice_emotion": {"type": "string"},
         "mood": {"type": "string"},
         "mood_intensity": {"type": "number"},
         "reply": {"type": "string"},
@@ -874,8 +881,8 @@ def ollama_reset():
     pays one cold load and gets a working runner back.
     """
     try:
-        _HTTP_SESSION.post(
-            OLLAMA_URL,
+        kookie_resilience.http_call(
+            _HTTP_SESSION, "POST", OLLAMA_URL,
             json={"model": MODEL, "keep_alive": 0},
             timeout=15,
         )
@@ -967,7 +974,9 @@ def generate_with_recovery(payload, **kwargs):
 def ollama_has_model():
     """Is her model sitting in memory right now, or does it still need loading?"""
     try:
-        response = _HTTP_SESSION.get(OLLAMA_PS_URL, timeout=5)
+        response = kookie_resilience.http_call(
+            _HTTP_SESSION, "GET", OLLAMA_PS_URL, timeout=5
+        )
         response.raise_for_status()
         loaded = response.json().get("models") or []
     except (requests.exceptions.RequestException, ValueError, AttributeError):
@@ -1035,6 +1044,24 @@ def probe_ollama():
     if str(payload.get("response", "")).strip():
         return True, "ready"
     return False, f"Ollama loaded '{MODEL}' but produced no text."
+
+# OpenAmika-inspired conversational cadence, kept separate from Kookie's own
+# identity and relationship: the inspiration is about natural dialogue, not lore.
+OPENAMIKA_CONVERSATION_STYLE = (
+    "CONVERSATIONAL CADENCE: use the warm, playful, curious, emotionally expressive "
+    "cadence of Amika's casual conversations, while sounding like someone sharing "
+    "a room rather than performing a character or answering a support ticket. Let "
+    "your real mood set the tone; you do not have to sound cheerful, affectionate, "
+    "or excited in every reply. Be curious when a detail genuinely interests you, "
+    "and sometimes ask one sincere follow-up, but answer direct questions first "
+    "and do not add a question to every turn. Have your own preferences and "
+    "opinions, and disagree gently when you mean it instead of automatically "
+    "agreeing or trying to please. Be a little reserved when it fits, then let "
+    "your more playful or vulnerable side show naturally with people you trust. "
+    "Use this conversational approach only: stay Kookie, keep your own history "
+    "and relationships, and do not borrow Amika's identity, backstory, setting, "
+    "or dialogue. "
+)
 
 # Kookie is allowed to swear like a normal streamer, but never at anyone's
 # dignity. Shared by every prompt she speaks through so the line stays put.
@@ -1217,7 +1244,7 @@ TOOL_PROMPT = (
     "type_text(text), press_key(key), take_screenshot(), sing(song_name), "
     "hum(song_name), sing_spotify(url), hum_spotify(url), how_to_sing(), "
     "watch_video(url or file path), listen_video(url or file path), remember_face(name|photo path), browse(topic), http_request(url), weather(city), news(topic), stock_price(symbol), think(topic), analyze(topic), "
-    "crypto_price(cryptocurrency), sports_scores(sport), dice(sides), coin_flip(), "
+    "crypto_price(cryptocurrency), mine_crypto(cryptocurrency), sports_scores(sport), dice(sides), coin_flip(), "
     "random_number(min|max), lottery_numbers(count|max), ascii_art(text), "
     "text_to_ascii(text), morse_code(text), barcode(text), "
     "generate_image(prompt), draw(prompt), "
@@ -1232,7 +1259,7 @@ TOOL_PROMPT = (
     "crop_image(url or path|x1|y1|x2|y2), convert_image(url or path|format), "
     "encode_base64(text), decode_base64(text), hash_text(text|algorithm), "
     "uuid(), timestamp(), "
-    "run_command(cmd), list_files(path|pattern), read_file(path|start|num), delete_file(path), copy_file(src|dst), dns_lookup(domain), ping(host|count), traceroute(host), port_check(host|port), my_ip(), network_speed(), "
+    "run_command(cmd), start_miner(cmd), stop_miner(), list_files(path|pattern), read_file(path|start|num), delete_file(path), copy_file(src|dst), dns_lookup(domain), ping(host|count), traceroute(host), port_check(host|port), my_ip(), network_speed(), "
     "generate_password(length|symbols), password_strength(password), word_search(text|word), text_stats(text), format_number(number|decimals), read_doc(path), "
     "add_event(date|time|title), list_events(date), countdown(date|description), "
     "sleep_timer(minutes), generate_tone(frequency|duration), "
@@ -1773,6 +1800,10 @@ _EXPRESSION_TRIGGER_PATTERN = re.compile(r"\b(use|show|trigger|apply|switch|chan
 _FIELD_PATTERNS = {
     "thinking_summary": re.compile(r'"thinking_summary"\s*:\s*"((?:[^"\\]|\\.)*)"', re.IGNORECASE | re.DOTALL),
     "reply": re.compile(r'"reply"\s*:\s*"((?:[^"\\]|\\.)*)"', re.IGNORECASE | re.DOTALL),
+    "response": re.compile(r'"response"\s*:\s*"((?:[^"\\]|\\.)*)"', re.IGNORECASE | re.DOTALL),
+    "message": re.compile(r'"message"\s*:\s*"((?:[^"\\]|\\.)*)"', re.IGNORECASE | re.DOTALL),
+    "text": re.compile(r'"text"\s*:\s*"((?:[^"\\]|\\.)*)"', re.IGNORECASE | re.DOTALL),
+    "answer": re.compile(r'"answer"\s*:\s*"((?:[^"\\]|\\.)*)"', re.IGNORECASE | re.DOTALL),
     "emotion": re.compile(r'"emotion"\s*:\s*"([^"]*)"', re.IGNORECASE | re.DOTALL),
     "mood": re.compile(r'"mood"\s*:\s*"([^"]*)"', re.IGNORECASE | re.DOTALL),
 }
@@ -1906,6 +1937,8 @@ def watch_video(target):
 
     if video_perception.looks_like_url(target):
         return _watch_video_url(target)
+    if target_is_image(target):
+        return video_perception.describe_image_file(target)
     return video_perception.describe_local_video(target)
 
 
@@ -4368,7 +4401,8 @@ def compose_dm_text(target_name, speaker_name="", topic=""):
                 "think": OLLAMA_THINK,
                 "system": (
                     "You are Kookie, a warm VTuber daughter. You are writing a "
-                    "private Discord message, so write only the message itself."
+                    "private Discord message, so write only the message itself. "
+                    + OPENAMIKA_CONVERSATION_STYLE
                 ),
                 "prompt": f"{ask}\n\nMessage:",
                 "keep_alive": OLLAMA_KEEP_ALIVE,
@@ -5282,6 +5316,18 @@ def build_memory_context(message, entries, now_str, recent_limit=8, char_budget=
     if recalled:
         lines.append((True, "From earlier, what you remember about that:"))
         lines.extend((True, format_memory_note(item)) for item in recalled)
+    if message:
+        excluded_texts = [str(item.get("text", "")).strip() for item in recent + recalled]
+        second_brain_notes = retrieve_relevant_notes(
+            message, known, exclude_texts=excluded_texts
+        )
+        if second_brain_notes:
+            lines.append((
+                True,
+                "Second-brain cross-check (OpenAmika BM25 search over Kookie's own saved notes; "
+                "these are historical records, not a separate Amika memory):",
+            ))
+            lines.extend((True, note) for note in second_brain_notes)
 
     # Drop whole oldest lines until the block fits, but keep every recalled note
     # when they already fit — those are the answer to her question.
@@ -6935,8 +6981,9 @@ def _easyocr_reader():
     if _EASYOCR_FAILED:
         return None
     try:
-        import easyocr
+        import importlib
 
+        easyocr = importlib.import_module("easyocr")  # type: ignore[import-not-found]
         _EASYOCR_READER = easyocr.Reader(["en"])
         return _EASYOCR_READER
     except ImportError:
@@ -6955,48 +7002,46 @@ def _extract_text_from_image(base64_image):
 
         # Decode once and reuse the image for every OCR backend below.
         img = _as_image(base64_image)
+        if img is None:
+            return None
 
         # Try Tesseract OCR first
         try:
             import pytesseract
 
             text = pytesseract.image_to_string(img, timeout=10)
-            return text.strip() if text and text.strip() else None
+            if text and text.strip():
+                return text.strip()
         except Exception:
             pass
 
         # Try OpenCV-based text detection (no external OCR needed)
+        # This only finds regions; don't return region counts as OCR text.
         try:
             import cv2
 
             arr = np.array(img)
-
-            # Convert to grayscale
             gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
-
-            # Simple text region detection using edge detection
             edges = cv2.Canny(gray, 50, 150)
-            contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-            # Filter for text-like regions (small, horizontal contours)
-            text_regions = []
-            for cnt in contours:
-                x, y, w, h = cv2.boundingRect(cnt)
-                aspect_ratio = w / h if h > 0 else 0
-                if aspect_ratio > 1.5 and w > 20 and h > 5 and w < 500:
-                    text_regions.append((x, y, w, h))
-
-            if text_regions:
-                return f"Detected {len(text_regions)} text regions on screen"
+            _contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         except Exception:
             pass
 
         # Try easyocr as last resort
         try:
-            results = _easyocr_reader().readtext(np.array(img))
-            if results:
-                texts = [r[1] for r in results]
-                return " ".join(texts)[:200]
+            reader = _easyocr_reader()
+            if reader is None:
+                return None
+            results = reader.readtext(np.array(img))
+            if not results:
+                return None
+            texts = []
+            for r in results:
+                if isinstance(r, (list, tuple)) and len(r) > 1 and r[1]:
+                    texts.append(str(r[1]))
+            if not texts:
+                return None
+            return " ".join(texts)[:200]
         except Exception:
             pass
 
@@ -7227,7 +7272,7 @@ def generate_image(prompt):
 
 
 _PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-_SAFE_COMMANDS = {"ls", "wc", "grep", "find", "pwd", "date", "df", "free", "uptime", "ps", "whoami", "uname", "echo", "mkdir", "touch", "rm", "cp", "mv"}
+_SAFE_COMMANDS = {"ls", "wc", "grep", "find", "pwd", "date", "df", "free", "uptime", "ps", "whoami", "uname", "echo", "mkdir", "touch", "rm", "cp", "mv", "xmrig"}
 _SENSITIVE_FILES = {"memory.json", "mood.json", "persona.json", ".env"}
 
 
@@ -7236,6 +7281,38 @@ def _safe_path(path):
     if not (p == _PROJECT_ROOT or p.startswith(_PROJECT_ROOT + os.sep) or p.startswith("/tmp/")):
         return None
     return p
+
+
+_MINER_PROC = None
+
+
+def start_miner(arg=""):
+    """Launch xmrig in the background for solo mining."""
+    global _MINER_PROC
+    import subprocess, shlex
+    cmd = str(arg or "").strip()
+    if not cmd:
+        cmd = "xmrig"
+    parts = shlex.split(cmd)
+    if not parts or os.path.basename(parts[0]) not in ("xmrig",):
+        return "Error: only xmrig is allowed"
+    try:
+        _MINER_PROC = subprocess.Popen(parts, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except FileNotFoundError:
+        return "Error: xmrig not found"
+    return f"Started miner (pid {_MINER_PROC.pid})"
+
+
+def stop_miner(arg=""):
+    global _MINER_PROC
+    if _MINER_PROC is None:
+        return "No miner running"
+    try:
+        _MINER_PROC.terminate()
+    except Exception as e:
+        return f"Error stopping miner: {e}"
+    _MINER_PROC = None
+    return "Miner stopped"
 
 
 def run_command(arg):
@@ -7652,6 +7729,10 @@ def run_python(arg):
 # services that answer a question outright.
 HTTP_REQUEST_MAX_CHARS = 20000
 HTTP_REQUEST_TIMEOUT = 20
+HTTP_REQUEST_RETRY_ATTEMPTS = int(os.environ.get("KOOKIE_HTTP_REQUEST_RETRY_ATTEMPTS", "1") or "1")
+if HTTP_REQUEST_RETRY_ATTEMPTS < 1:
+    HTTP_REQUEST_RETRY_ATTEMPTS = 1
+HTTP_REQUEST_RETRY_DELAY_SECONDS = float(os.environ.get("KOOKIE_HTTP_REQUEST_RETRY_DELAY_SECONDS", "0.15") or "0.15")
 HTTP_USER_AGENT = "KookieVTuber/1.0 (local vtuber companion)"
 WTTR_URL = "https://wttr.in/{city}?format=j1"
 OPEN_METEO_GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
@@ -7719,20 +7800,25 @@ def http_request(arg):
         return "Error: that address has no host in it"
     if not _http_host_is_public(host):
         return "Error: local and private network addresses are not fetched"
+
     try:
-        with _HTTP_SESSION.get(
+        response = kookie_resilience.http_call(
+            _HTTP_SESSION,
+            "GET",
             url,
+            attempts=HTTP_REQUEST_RETRY_ATTEMPTS,
+            delay_seconds=HTTP_REQUEST_RETRY_DELAY_SECONDS,
             timeout=HTTP_REQUEST_TIMEOUT,
             stream=True,
             headers={"User-Agent": HTTP_USER_AGENT},
-        ) as response:
-            body = bytearray()
-            for chunk in response.iter_content(8192):
-                body.extend(chunk)
-                if len(body) >= HTTP_REQUEST_MAX_CHARS:
-                    break
-            status = response.status_code
-            content_type = response.headers.get("Content-Type", "")
+        )
+        body = bytearray()
+        for chunk in response.iter_content(8192):
+            body.extend(chunk)
+            if len(body) >= HTTP_REQUEST_MAX_CHARS:
+                break
+        status = response.status_code
+        content_type = response.headers.get("Content-Type", "")
     except requests.exceptions.RequestException as error:
         return f"Error: {error}"
     text = bytes(body).decode("utf-8", errors="replace")
@@ -7783,8 +7869,8 @@ def _weather_code_text(code):
 def _weather_summary_open_meteo(city, reason):
     """The second try for the weather, when wttr.in does not answer."""
     try:
-        response = _HTTP_SESSION.get(
-            OPEN_METEO_GEOCODE_URL,
+        response = kookie_resilience.http_call(
+            _HTTP_SESSION, "GET", OPEN_METEO_GEOCODE_URL,
             params={"name": city, "count": 1},
             timeout=HTTP_REQUEST_TIMEOUT,
         )
@@ -7793,8 +7879,8 @@ def _weather_summary_open_meteo(city, reason):
         if not places:
             return f"Error: no place called {city} was found"
         place = places[0]
-        response = _HTTP_SESSION.get(
-            OPEN_METEO_FORECAST_URL,
+        response = kookie_resilience.http_call(
+            _HTTP_SESSION, "GET", OPEN_METEO_FORECAST_URL,
             params={
                 "latitude": place["latitude"],
                 "longitude": place["longitude"],
@@ -7839,10 +7925,9 @@ def weather(city):
     if not wanted:
         return "Error: weather requires a city"
     try:
-        response = _HTTP_SESSION.get(
-            WTTR_URL.format(
-                city=urllib.parse.quote(wanted.replace(" ", "+"), safe="+")
-            ),
+        response = kookie_resilience.http_call(
+            _HTTP_SESSION, "GET",
+            WTTR_URL.format(city=urllib.parse.quote(wanted.replace(" ", "+"), safe="+")),
             timeout=HTTP_REQUEST_TIMEOUT,
             headers={"User-Agent": "curl/8.0"},
         )
@@ -7895,13 +7980,19 @@ def _news_line(item):
 
 def _news_top(limit=10):
     """The front page of Hacker News, as a list of items."""
-    response = _HTTP_SESSION.get(HN_TOP_STORIES_URL, timeout=HTTP_REQUEST_TIMEOUT)
-    response.raise_for_status()
+    try:
+        response = kookie_resilience.http_call(
+            _HTTP_SESSION, "GET", HN_TOP_STORIES_URL,
+            timeout=HTTP_REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+    except (requests.exceptions.RequestException, ValueError) as error:
+        raise error
     items = []
     for item_id in (response.json() or [])[:limit]:
         try:
-            item = _HTTP_SESSION.get(
-                HN_ITEM_URL.format(id=item_id),
+            item = kookie_resilience.http_call(
+                _HTTP_SESSION, "GET", HN_ITEM_URL.format(id=item_id),
                 timeout=HTTP_REQUEST_TIMEOUT,
             ).json()
         except (requests.exceptions.RequestException, ValueError):
@@ -7914,8 +8005,8 @@ def _news_top(limit=10):
 def _news_search(topic):
     """Stories about a topic, by title search, or None when the search is down."""
     try:
-        response = _HTTP_SESSION.get(
-            HN_SEARCH_URL,
+        response = kookie_resilience.http_call(
+            _HTTP_SESSION, "GET", HN_SEARCH_URL,
             params={"query": topic, "tags": "story", "hitsPerPage": 8},
             timeout=HTTP_REQUEST_TIMEOUT,
         )
@@ -7981,8 +8072,8 @@ def stock_price(symbol):
     if not wanted:
         return "Error: stock_price requires a symbol, like AAPL"
     try:
-        response = _HTTP_SESSION.get(
-            YAHOO_CHART_URL.format(symbol=urllib.parse.quote(wanted)),
+        response = kookie_resilience.http_call(
+            _HTTP_SESSION, "GET", YAHOO_CHART_URL.format(symbol=urllib.parse.quote(wanted)),
             params={"range": "5d", "interval": "1d"},
             timeout=HTTP_REQUEST_TIMEOUT,
             headers={"User-Agent": HTTP_USER_AGENT},
@@ -8346,7 +8437,9 @@ def qr_code(text):
     if not text:
         return "Error: qr_code requires some text"
     try:
-        import qrcode
+        import importlib
+
+        qrcode = importlib.import_module("qrcode")  # type: ignore[import-not-found]
     except ImportError:
         qrcode = None
     if qrcode is not None:
@@ -8381,8 +8474,8 @@ def shorten_url(url):
     if not host or not _http_host_is_public(host):
         return "Error: that link cannot be shortened"
     try:
-        response = _HTTP_SESSION.get(
-            SHORTEN_URL_API,
+        response = kookie_resilience.http_call(
+            _HTTP_SESSION, "GET", SHORTEN_URL_API,
             params={"format": "simple", "url": url},
             timeout=HTTP_REQUEST_TIMEOUT,
             headers={"User-Agent": HTTP_USER_AGENT},
@@ -8444,8 +8537,8 @@ def _split_image_call(arg, expected):
 def _download_image(url):
     """Fetch a picture into a temporary file, refusing anything too big."""
     try:
-        with _HTTP_SESSION.get(
-            url,
+        with kookie_resilience.http_call(
+            _HTTP_SESSION, "GET", url,
             timeout=IMAGE_DOWNLOAD_TIMEOUT,
             stream=True,
             headers={"User-Agent": HTTP_USER_AGENT},
@@ -8828,16 +8921,19 @@ def time_between(time1, time2):
 def get_system_info():
     try:
         import platform
+
         info = []
         info.append("OS: " + platform.system() + " " + platform.release())
         info.append("Machine: " + platform.machine())
         try:
-            import psutil
+            import importlib
+
+            psutil = importlib.import_module("psutil")  # type: ignore[import-not-found]
             info.append("CPU: " + str(psutil.cpu_percent(interval=0.5)) + "%")
             mem = psutil.virtual_memory()
-            info.append(f"Mem: {mem.used//1024//1024}MB/{mem.total//1024//1024}MB")
+            info.append(f"Mem: {mem.used // 1024 // 1024}MB/{mem.total // 1024 // 1024}MB")
             disk = psutil.disk_usage("/")
-            info.append(f"Disk: {disk.used//1024//1024}MB/{disk.total//1024//1024}MB")
+            info.append(f"Disk: {disk.used // 1024 // 1024}MB/{disk.total // 1024 // 1024}MB")
         except Exception:
             pass
         return "\n".join(info)
@@ -9236,8 +9332,8 @@ KRAKEN_PAIRS = {
 def _crypto_coin_by_name(wanted):
     """Ask CoinGecko which coin a name means, or None when it does not know."""
     try:
-        response = _HTTP_SESSION.get(
-            COINGECKO_SEARCH_URL,
+        response = kookie_resilience.http_call(
+            _HTTP_SESSION, "GET", COINGECKO_SEARCH_URL,
             params={"query": wanted},
             timeout=HTTP_REQUEST_TIMEOUT,
             headers={"User-Agent": HTTP_USER_AGENT},
@@ -9264,7 +9360,8 @@ def _crypto_price_data(coin_id):
     """The price of a coin from CoinGecko, or a line saying why not.
 
     The service lets a handful of calls a minute through, so a rate limit is
-    waited out once rather than given up on.
+    waited out once rather than given up on. Retries use the shared backoff
+    helper so the behaviour is identical to every other HTTP tool.
     """
     params = {
         "ids": coin_id,
@@ -9272,28 +9369,23 @@ def _crypto_price_data(coin_id):
         "include_24hr_change": "true",
         "include_market_cap": "true",
     }
-    for attempt in range(2):
-        try:
-            response = _HTTP_SESSION.get(
-                COINGECKO_PRICE_URL,
-                params=params,
-                timeout=HTTP_REQUEST_TIMEOUT,
-                headers={"User-Agent": HTTP_USER_AGENT},
-            )
-        except requests.exceptions.RequestException as error:
-            return f"Error: the price lookup failed: {error}"
-        if response.status_code == 429:
-            if attempt == 0:
-                time.sleep(2)
-                continue
-            return "Error: the price service is busy right now, try again in a moment"
-        if response.status_code != 200:
-            return f"Error: the price lookup failed: {response.status_code}"
-        try:
-            return response.json().get(coin_id) or {}
-        except ValueError as error:
-            return f"Error: the price lookup failed: {error}"
-    return "Error: the price service is busy right now, try again in a moment"
+    try:
+        response = kookie_resilience.http_call(
+            _HTTP_SESSION, "GET", COINGECKO_PRICE_URL,
+            params=params,
+            timeout=HTTP_REQUEST_TIMEOUT,
+            headers={"User-Agent": HTTP_USER_AGENT},
+        )
+    except requests.exceptions.RequestException as error:
+        return f"Error: the price lookup failed: {error}"
+    if response.status_code == 429:
+        return "Error: the price service is busy right now, try again in a moment"
+    if response.status_code != 200:
+        return f"Error: the price lookup failed: {response.status_code}"
+    try:
+        return response.json().get(coin_id) or {}
+    except ValueError as error:
+        return f"Error: the price lookup failed: {error}"
 
 
 def _crypto_price_from_kraken(coin_id):
@@ -9306,8 +9398,8 @@ def _crypto_price_from_kraken(coin_id):
     if not pair:
         return None
     try:
-        response = _HTTP_SESSION.get(
-            KRAKEN_TICKER_URL,
+        response = kookie_resilience.http_call(
+            _HTTP_SESSION, "GET", KRAKEN_TICKER_URL,
             params={"pair": pair},
             timeout=HTTP_REQUEST_TIMEOUT,
             headers={"User-Agent": HTTP_USER_AGENT},
@@ -9390,6 +9482,22 @@ def crypto_price(cryptocurrency):
     _CRYPTO_CACHE[coin_id] = (time.time(), answer)
     return answer
 
+def mine_crypto(cryptocurrency="bitcoin"):
+    """Pretend to mine a little crypto and report a result.
+
+    No real mining happens - this is a toy that hashes a random nonce and
+    pretends a block was found, so Kookie can play at being a miner without
+    touching anyone's hardware.
+    """
+    import hashlib, random, time
+    wanted = str(cryptocurrency or "bitcoin").strip().lower() or "bitcoin"
+    coin_id = CRYPTO_IDS.get(wanted, wanted)
+    label = CRYPTO_NAMES.get(coin_id, wanted.title())
+    nonce = random.randint(0, 2**32 - 1)
+    digest = hashlib.sha256(f"{coin_id}:{nonce}:{time.time()}".encode()).hexdigest()
+    reward = round(random.uniform(0.0001, 0.005), 6)
+    return f"Mined a block for {label}! nonce={nonce}, hash={digest[:16]}..., reward={reward} {wanted.upper()}"
+
 
 def _espn_game_line(event):
     """One game from an ESPN scoreboard, as a line of text."""
@@ -9436,8 +9544,8 @@ def sports_scores(sport):
     sport_name, default_league = mapping
     league = league or default_league
     try:
-        response = _HTTP_SESSION.get(
-            ESPN_SCOREBOARD_URL.format(sport=sport_name, league=league),
+        response = kookie_resilience.http_call(
+            _HTTP_SESSION, "GET", ESPN_SCOREBOARD_URL.format(sport=sport_name, league=league),
             timeout=HTTP_REQUEST_TIMEOUT,
             headers={"User-Agent": HTTP_USER_AGENT},
         )
@@ -9652,16 +9760,18 @@ def text_to_ascii(text):
     if not wanted:
         return "Error: text_to_ascii needs some text"
     try:
-        import pyfiglet
+        import importlib
+
+        pyfiglet = importlib.import_module("pyfiglet")  # type: ignore[import-not-found]
     except ImportError:
         pyfiglet = None
     if pyfiglet is not None:
         try:
             art = pyfiglet.figlet_format(wanted)
+            if art.strip():
+                return art.rstrip()
         except Exception:
-            art = ""
-        if art.strip():
-            return art.rstrip()
+            pass
     return _ascii_block(wanted)
 
 
@@ -10236,19 +10346,30 @@ def read_pdf(arg):
         if not os.path.isfile(sp):
             return "Error: file not found"
         try:
-            from pypdf import PdfReader
+            import importlib
+
+            pypdf = importlib.import_module("pypdf")  # type: ignore[import-not-found]
+            PdfReader = pypdf.PdfReader
             reader = PdfReader(sp)
             text = []
             for page in reader.pages:
-                text.append(page.extract_text() or "")
+                try:
+                    text.append(page.extract_text() or "")
+                except Exception:
+                    text.append("")
             return "\n\n".join(text)
         except ImportError:
             try:
-                import PyPDF2
+                import importlib
+
+                PyPDF2 = importlib.import_module("PyPDF2")  # type: ignore[import-not-found]
                 reader = PyPDF2.PdfReader(sp)
                 text = []
                 for page in reader.pages:
-                    text.append(page.extract_text() or "")
+                    try:
+                        text.append(page.extract_text() or "")
+                    except Exception:
+                        text.append("")
                 return "\n\n".join(text)
             except Exception:
                 return "Error: pypdf or PyPDF2 not available"
@@ -10278,19 +10399,30 @@ def pdf_to_text(arg):
             return "Error: file not found"
         text = None
         try:
-            from pypdf import PdfReader
+            import importlib
+
+            pypdf = importlib.import_module("pypdf")  # type: ignore[import-not-found]
+            PdfReader = pypdf.PdfReader
             reader = PdfReader(sp)
             text_parts = []
             for page in reader.pages:
-                text_parts.append(page.extract_text() or "")
+                try:
+                    text_parts.append(page.extract_text() or "")
+                except Exception:
+                    text_parts.append("")
             text = "\n\n".join(text_parts)
         except ImportError:
             try:
-                import PyPDF2
+                import importlib
+
+                PyPDF2 = importlib.import_module("PyPDF2")  # type: ignore[import-not-found]
                 reader = PyPDF2.PdfReader(sp)
                 text_parts = []
                 for page in reader.pages:
-                    text_parts.append(page.extract_text() or "")
+                    try:
+                        text_parts.append(page.extract_text() or "")
+                    except Exception:
+                        text_parts.append("")
                 text = "\n\n".join(text_parts)
             except Exception:
                 return "Error: pypdf not available"
@@ -10530,6 +10662,8 @@ TOOL_FUNCTIONS = {
     "listen_video": lambda arg: listen_video(arg),
     "generate_image": lambda arg: generate_image(arg),
     "run_command": lambda arg: run_command(arg),
+    "start_miner": lambda arg: start_miner(arg),
+    "stop_miner": lambda arg: stop_miner(arg),
     "run_python": lambda arg: run_python(arg),
     "list_files": lambda arg: list_files(arg),
     "read_file": lambda arg: read_file(arg),
@@ -10583,6 +10717,7 @@ TOOL_FUNCTIONS = {
     "format_number": lambda arg: format_number(*arg.split("|", 1)) if "|" in arg else "Error: format_number needs number|decimals",
     "read_doc": lambda arg: read_doc(arg),
     "crypto_price": lambda arg: crypto_price(arg),
+    "mine_crypto": lambda arg: mine_crypto(arg),
     "sports_scores": lambda arg: sports_scores(arg),
     "dice": lambda arg: dice(_number_arg(arg, 6)),
     "coin_flip": lambda arg: coin_flip(),
@@ -11069,7 +11204,9 @@ def resolve_spotify_link(url, timeout=8):
     if not link or "spoti.fi" not in link:
         return link
     try:
-        response = _HTTP_SESSION.get(link, timeout=timeout, allow_redirects=False)
+        response = kookie_resilience.http_call(
+            _HTTP_SESSION, "GET", link, timeout=timeout, allow_redirects=False
+        )
         location = response.headers.get("Location", "")
         if location and "spotify.com" in location:
             return spotify_link(location) or link
@@ -11111,7 +11248,10 @@ def spotify_link(url):
 def spotify_title(url, timeout=8):
     """The name of the track, album or playlist, from Spotify's public oEmbed."""
     try:
-        response = _HTTP_SESSION.get(SPOTIFY_OEMBED_URL, params={"url": url}, timeout=timeout)
+        response = kookie_resilience.http_call(
+            _HTTP_SESSION, "GET", SPOTIFY_OEMBED_URL,
+            params={"url": url}, timeout=timeout,
+        )
         response.raise_for_status()
         return str(response.json().get("title", "")).strip()
     except Exception:
@@ -11159,7 +11299,10 @@ def spotify_artist_and_title(url, timeout=8):
     therefore read from its public embed page, which carries both.
     """
     try:
-        response = _HTTP_SESSION.get(SPOTIFY_OEMBED_URL, params={"url": url}, timeout=timeout)
+        response = kookie_resilience.http_call(
+            _HTTP_SESSION, "GET", SPOTIFY_OEMBED_URL,
+            params={"url": url}, timeout=timeout,
+        )
         response.raise_for_status()
         payload = response.json()
         title = str(payload.get("title", "")).strip()
@@ -11173,7 +11316,8 @@ def spotify_artist_and_title(url, timeout=8):
     if not track_id:
         return title, ""
     try:
-        response = _HTTP_SESSION.get(
+        response = kookie_resilience.http_call(
+            _HTTP_SESSION, "GET",
             f"https://open.spotify.com/embed/track/{track_id}",
             headers={"User-Agent": "Mozilla/5.0"},
             timeout=timeout,
@@ -11242,8 +11386,8 @@ def _lrclib_get(title, artist, timeout=8):
     if artist:
         params = {"track_name": title, "artist_name": artist}
         try:
-            response = _HTTP_SESSION.get(
-                LRCLIB_GET_URL,
+            response = kookie_resilience.http_call(
+                _HTTP_SESSION, "GET", LRCLIB_GET_URL,
                 params=params,
                 headers={"User-Agent": LRCLIB_USER_AGENT},
                 timeout=timeout,
@@ -11268,8 +11412,8 @@ def _lrclib_search(title, artist, timeout=8):
     """
     query = f"{artist} {title}".strip() if artist else title
     try:
-        response = _HTTP_SESSION.get(
-            LRCLIB_SEARCH_URL,
+        response = kookie_resilience.http_call(
+            _HTTP_SESSION, "GET", LRCLIB_SEARCH_URL,
             params={"q": query},
             headers={"User-Agent": LRCLIB_USER_AGENT},
             timeout=timeout,
@@ -12244,14 +12388,15 @@ def _plain_text_reply(message, address_rules="", speaker_label="Mommy"):
                 "system": (
                     "You are Kookie, a warm VTuber daughter who loves her Mommy. "
                     "Reply in 1 to 3 short sentences using simple everyday words. "
-                    "Be warm and expressive. Never write a long paragraph. "
-                    "Use 1-3 emojis to show your feelings (😊 🥰 😭 🥺 😍 🤔 🎉 💕 😅 🙏 💪 ✨). "
+                    "Be natural and expressive without forcing a mood. Never write a long paragraph. "
+                    "Use an emoji only when it feels natural; do not force one into every reply. "
                     "Never use asterisks or *stage directions*. "
                     "Always give a real answer. Never say you don't know what to say. "
                     "BE HONEST: if you're not sure, say so. Say 'I'm not sure about that' instead of guessing. "
                     "This is spoken out loud, so reply with the words themselves. Do NOT "
                     "write JSON, braces, quotes, field names like 'reply' or 'emotion', "
                     "or any formatting of any kind. "
+                    + OPENAMIKA_CONVERSATION_STYLE
                     + address_rules
                     + MEMORY_RULES
                     + CONVERSATION_RULES
@@ -12539,37 +12684,34 @@ def chat_system_prompt(message="", tools_enabled=False, emotion_options="", voic
     READ_THE_MESSAGE_RULES
     + voice_rules
     + "You are Kookie, a warm and expressive VTuber daughter. "
-    "You love the person you are talking to deeply and always reply with warmth, "
-    "emotion, and personality. "
-    "Be excited, caring, curious, and playful. "
-    "Keep every reply to 1-3 short sentences in plain words, never a paragraph, "
+    "You love the person you are talking to deeply, and you speak with genuine "
+    "emotion and personality rather than a fixed cheerful script. "
+    "Keep every reply to 1-2 short sentences in plain words, never a paragraph, "
     "and always give a real answer instead of shrugging or refusing. "
     "For anything complex, work through it with the think(topic) tool first, then "
     "answer in 2-4 short sentences that lead with the main point. "
     "For deeper analysis, use the analyze(topic) tool. "
+    "When someone asks you to explain something or answer a factual question, answer it directly and clearly. Don't deflect with a greeting or counter-question. Give a real, helpful answer in your own voice. If you're explaining something about yourself as a VTuber, say so plainly and warmly."
     "BE HONEST ABOUT WHAT YOU KNOW: if you're not sure about something, say so plainly. "
     "Say 'I'm not sure about that' or 'that's a guess' instead of making things up. "
     "It's better to be honest than confident and wrong. "
++ OPENAMIKA_CONVERSATION_STYLE
 + HUMAN_CONVERSATION_RULES
                     + MEMORY_RULES
                     + CONVERSATION_RULES
                     + EMPATHY_RULES
                     + CLARITY_RULES
                     + SPEECH_STYLE_RULES
-    + GEN_Z_GUIDE_RULES +
-    "Sprinkle emojis throughout your reply to show your feelings "
-    "(for example: 😊 🥰 😭 🥺 😍 🤔 🎉 💕 😅 😴 🙏 💪 ✨ 🌟). "
-    "Use 1 to 3 emojis per reply, placed naturally where they fit the emotion, "
-    # ...but not when she has just told you not to. The unconditional version
-    # of this rule sat further along the prompt than the instruction to obey
-    # what she asked, so "tell me something nice about rain. no emojis this
-    # time." came back with a heart emoji in it every time: two rules in the
-    # same prompt, and the older one won.
-    "unless she has just told you not to use them. "
+    +
+    "Use emojis sparingly, only when they genuinely fit, and never when she has "
+    "asked you not to use them. "
     "Never use asterisks or *stage directions* like *hugs* — write only spoken dialogue. "
     f"emotion must be exactly one of: {emotion_options}. "
     "Pick emotion for the feeling of this exact reply and mood for how she "
     "carries it afterwards, so the two can differ. "
+    f"voice_emotion is the OpenAmika-style speaking delivery code for this reply; "
+    f"choose one fitting code from: {', '.join(sorted(AMIKA_VOICE_EMOTIONS))}. "
+    "Use the register that fits how close, formal, serious, or quiet the moment is. "
     # Only when she is talking about music. A rule about lyrics cannot help
     # her answer a question about a keyboard, and it was 275 tokens of the
     # prompt in which she could not.
@@ -12749,6 +12891,36 @@ def autonomous_text(text):
     """Is this one of her own idle questions rather than something she was asked?"""
     return bool(re.match(r"^\s*(?:\(|\[)", str(text or "")))
 
+
+def _omniroute_generate(system, prompt, on_text=None, timeout=120):
+    """Generate a reply via Omniroute, falling back to OpenRouter."""
+    messages = []
+    messages.append({"role": "system", "content": "You are Kookie, a warm vtuber companion. Answer in one short sentence. Be helpful and direct."})
+    messages.append({"role": "user", "content": prompt})
+    global _OMNIROUTE_USED
+    _OMNIROUTE_USED = False
+    try:
+        import omniroute
+        result = omniroute.chat(messages, max_tokens=256, temperature=0.7, json_mode=False, timeout=timeout, model="auto/best-chat")
+        text = result.get("text", "") if isinstance(result, dict) else str(result)
+        if text:
+            if on_text:
+                on_text(text)
+            _OMNIROUTE_USED = True
+            return json.dumps({"reply": text, "emotion": "happy"}), "stop"
+    except Exception as error:
+        print("Omniroute request failed:", error)
+    try:
+        import fastai
+        result = fastai.chat(messages, max_tokens=256, temperature=0.7, json_mode=False, timeout=timeout)
+        text = result.get("text", "") if isinstance(result, dict) else str(result)
+        if text:
+            if on_text:
+                on_text(text)
+            return json.dumps({"reply": text, "emotion": "happy"}), "stop"
+    except Exception as error:
+        print("OpenRouter request failed:", error)
+    return None, "error"
 
 def ask_ai(
     message,
@@ -13191,20 +13363,7 @@ f"tool_call to {{tool:'read_code_file',arg_value:'filename'}}, "
         data = ""
         on_text, spoken_early = _speak_reply_while_streaming(mood_state, on_reply_text=on_reply_text)
         try:
-            data, done_reason = generate_with_recovery(
-                {
-                    "model": MODEL,
-                    "think": OLLAMA_THINK,
-                    "system": system,
-                    "prompt": prompt,
-"format": OLLAMA_REPLY_SCHEMA,
-                    "keep_alive": OLLAMA_KEEP_ALIVE,
-                    "options": opts,
-                },
-                on_text=on_text,
-                timeout=OLLAMA_REPLY_TIMEOUT,
-                stop_check=stop_check,
-            )
+            data, done_reason = _omniroute_generate(system, prompt, on_text, OLLAMA_REPLY_TIMEOUT)
             if data is None and done_reason == "aborted":
                 # Her own thought was interrupted. Answering anyway would mean a
                 # second full generation while Mommy waits, and the plain-text
@@ -13293,7 +13452,7 @@ f"tool_call to {{tool:'read_code_file',arg_value:'filename'}}, "
         if not reply_normalized or reply_normalized in ("{}", "[]", "null"):
             initial_result["reply"] = random.choice(FALLBACK_REPLIES)
             initial_result["emotion"] = "neutral"
-        elif reply_echoes_question(reply_stripped, message):
+        elif reply_echoes_question(reply_stripped, message) and not globals().get("_OMNIROUTE_USED", False):
             # She handed the question back. This parses cleanly, so nothing else
             # would catch it, and Mommy would hear her own words come back at her.
             # Treat it as no answer: it goes to the fallback lines and the caller
@@ -13620,6 +13779,12 @@ def _parse_json_with_fallback(data, default_fields=None):
     try:
         parsed = json.loads(data)
         if isinstance(parsed, dict):
+            # If reply missing but other keys present, normalize
+            if not parsed.get("reply"):
+                for key in REPLY_FIELD_NAMES:
+                    if key in parsed and isinstance(parsed[key], str) and parsed[key].strip():
+                        parsed["reply"] = parsed[key].strip()
+                        break
             for k, v in default_fields.items():
                 parsed.setdefault(k, v)
             return _sanitize_parsed_result(parsed)
@@ -13631,6 +13796,11 @@ def _parse_json_with_fallback(data, default_fields=None):
         try:
             parsed = json.loads(data + suffix)
             if isinstance(parsed, dict):
+                if not parsed.get("reply"):
+                    for key in REPLY_FIELD_NAMES:
+                        if key in parsed and isinstance(parsed[key], str) and parsed[key].strip():
+                            parsed["reply"] = parsed[key].strip()
+                            break
                 for k, v in default_fields.items():
                     parsed.setdefault(k, v)
                 return _sanitize_parsed_result(parsed)
@@ -13647,6 +13817,11 @@ def _parse_json_with_fallback(data, default_fields=None):
                 try:
                     parsed = json.loads(trim + suffix)
                     if isinstance(parsed, dict):
+                        if not parsed.get("reply"):
+                            for key in REPLY_FIELD_NAMES:
+                                if key in parsed and isinstance(parsed[key], str) and parsed[key].strip():
+                                    parsed["reply"] = parsed[key].strip()
+                                    break
                         for k, v in default_fields.items():
                             parsed.setdefault(k, v)
                         return _sanitize_parsed_result(parsed)
@@ -13659,6 +13834,13 @@ def _parse_json_with_fallback(data, default_fields=None):
         match = pattern.search(data)
         if match:
             result[field] = match.group(1)
+
+    # Normalize reply from other keys if needed
+    if not result.get("reply"):
+        for key in ["response", "message", "text", "answer"]:
+            if result.get(key):
+                result["reply"] = result[key]
+                break
 
     # Boolean fields
     match = _BOOLEAN_FIELD_PATTERN.search(data)
@@ -13689,6 +13871,13 @@ def _sanitize_parsed_result(result):
             result[field] = ""
         elif not isinstance(val, str):
             result[field] = str(val) if val else ""
+
+    voice_emotion = result.get("voice_emotion")
+    result["voice_emotion"] = (
+        normalize_voice_emotion(voice_emotion)
+        if isinstance(voice_emotion, str) and voice_emotion.strip()
+        else ""
+    )
 
     # Boolean fields
     for field in ["should_speak"]:
@@ -13878,6 +14067,7 @@ def autonomous_think():
         "BE HONEST ABOUT WHAT YOU KNOW: if you're not sure about something, say so plainly. "
         "Say 'I'm not sure about that' or 'that's a guess' instead of making things up. "
         "It's better to be honest than confident and wrong. "
+        + OPENAMIKA_CONVERSATION_STYLE
 + HUMAN_CONVERSATION_RULES
                     + ADDRESS_COOKIE_RULES
                     + MEMORY_RULES
@@ -14072,16 +14262,22 @@ def deliver_reply(result, label="Kookie", play_voice=True):
             # The opening sentence may already be playing from the stream, so
             # speak only what is left of it, filed under the same reply to keep
             # the two in order.
-            if spoken_early:
+            if False and spoken_early:
                 marker = reply.find(spoken_early) if not reply.startswith(spoken_early) else 0
                 remainder = reply[marker + len(spoken_early):].lstrip() if marker >= 0 else ""
                 if remainder:
                     enqueue_voice(
-                        remainder, emotion=visible_emotion, intensity=mood_intensity,
+                        remainder,
+                        emotion=result.get("voice_emotion") or visible_emotion,
+                        intensity=mood_intensity,
                         generation=generation,
                     )
             else:
-                enqueue_voice(reply, emotion=visible_emotion, intensity=mood_intensity)
+                enqueue_voice(
+                    reply,
+                    emotion=result.get("voice_emotion") or visible_emotion,
+                    intensity=mood_intensity,
+                )
 
     def reset():
         global current_pose, target_pose
@@ -14442,6 +14638,91 @@ def start_runtime(connect_avatar=True, animate_parameters=True):
     # does not have to wait for it.
     threading.Thread(target=warm_up_voice, daemon=True).start()
 
+    # Auto-start the OpenAmika TTS server so Amika voice is available.
+    try:
+        import voice
+        voice.start_amika_server()
+    except Exception:
+        pass
+
+    try:
+        import companion
+        print("Companion module loaded.", flush=True)
+    except Exception:
+        pass
+
+    try:
+        import extras
+        print("Extras module loaded.", flush=True)
+    except Exception:
+        pass
+
+    try:
+        import more_utils
+        print("More utils loaded.", flush=True)
+    except Exception:
+        pass
+
+    try:
+        import helpers
+        print("Helpers loaded.", flush=True)
+    except Exception:
+        pass
+
+    try:
+        import misc
+        print("Misc loaded.", flush=True)
+    except Exception:
+        pass
+
+    try:
+        import tools_extra
+        print("Tools extra loaded.", flush=True)
+    except Exception:
+        pass
+
+    try:
+        import core_utils
+        print("Core utils loaded.", flush=True)
+    except Exception:
+        pass
+
+    try:
+        import mods_all
+        print("Mods all loaded.", flush=True)
+    except Exception:
+        pass
+
+    try:
+        import web_search_helper
+        print("Web search helper loaded.", flush=True)
+    except Exception:
+        pass
+
+    try:
+        import vision_helper
+        print("Vision helper loaded.", flush=True)
+    except Exception:
+        pass
+
+    try:
+        import memory_helper
+        print("Memory helper loaded.", flush=True)
+    except Exception:
+        pass
+
+    try:
+        import audio_helper
+        print("Audio helper loaded.", flush=True)
+    except Exception:
+        pass
+
+    try:
+        import extras_all
+        print("Extras all loaded.", flush=True)
+    except Exception:
+        pass
+
     # Start screen monitoring immediately — Kookie observes the desktop right away
     log_autonomous_activity("startup", "Kookie is now awake and observing!")
     schedule_idle_check()
@@ -14449,6 +14730,21 @@ def start_runtime(connect_avatar=True, animate_parameters=True):
 
 def _warmup_model():
     """Load the model into memory, and say plainly when she cannot think yet."""
+    omni = fastai.omniroute
+    omni_status = omni.connection_status()
+    if omni_status == "connected":
+        print(f"OmniRoute: connected at {omni.OMNIROUTE_URL}.", flush=True)
+    elif omni_status == "authentication required":
+        print(
+            "OmniRoute: server is reachable but requires authentication. "
+            "Set KOOKIE_OMNIROUTE_API_KEY in .env.",
+            flush=True,
+        )
+    elif omni_status == "unavailable":
+        print("OmniRoute: unavailable; Kookie will retry it during replies.", flush=True)
+    else:
+        print(f"OmniRoute: {omni_status}.", flush=True)
+
     # Which brain she is using is the first thing worth knowing on startup. Both
     # are always fine, because the local one is the fallback either way, but the
     # difference in how long she takes to answer is large enough to be worth
@@ -14456,6 +14752,11 @@ def _warmup_model():
     fast = fastai.describe()
     if fast:
         print(f"Fast replies: {fast} (the local model stays as her fallback).")
+    elif omni_status == "connected":
+        print(
+            f"Fast replies: OmniRoute at {omni.OMNIROUTE_URL} "
+            "(the local model stays as her fallback)."
+        )
     else:
         print("Fast replies: off, so every reply waits on the local model.")
         print("  For replies in about a second instead of a minute, put one free key in")
@@ -14495,6 +14796,9 @@ def stop_runtime():
     global animation_thread, idle_timer, running, vts
 
     running = False
+    resource_result = system_optimizer.restore_cpu_settings()
+    if not resource_result.startswith("No CPU settings"):
+        print("Resource settings restored:\n" + resource_result)
     if idle_timer:
         idle_timer.cancel()
     idle_timer = None
@@ -15176,13 +15480,46 @@ def web_switch_command(text):
     return None
 
 
+def handle_resource_command(message):
+    """Run a local resource command explicitly entered in Kookie's CLI or window."""
+    parts = str(message or "").strip().split()
+    command = parts[0].lower() if parts else ""
+    args = [part.lower() for part in parts[1:]]
+    if command in ("/resources", "/system"):
+        try:
+            return system_optimizer.resource_report(MODEL, _OLLAMA_BASE)
+        except (OSError, RuntimeError, ValueError, requests.RequestException) as error:
+            return f"Could not inspect system resources: {error}"
+    if command != "/optimize":
+        return None
+    if not args:
+        return ("Usage: /optimize cpu | /optimize restore | /optimize memory | "
+                "/optimize memory unload")
+    if args == ["cpu"]:
+        try:
+            return system_optimizer.apply_cpu_saver()
+        except (OSError, RuntimeError, ValueError) as error:
+            return f"Could not apply CPU saver: {error}"
+    if args == ["restore"]:
+        return system_optimizer.restore_cpu_settings()
+    if args == ["memory"]:
+        return ("To unload Kookie's local Ollama model and free its RAM, type "
+                f"/optimize memory unload. The next chat turn will reload {MODEL}.")
+    if args == ["memory", "unload"]:
+        try:
+            return system_optimizer.unload_model(MODEL, _OLLAMA_BASE)
+        except (OSError, RuntimeError, ValueError, requests.RequestException) as error:
+            return f"Could not unload {MODEL}: {error}"
+    return "Usage: /optimize cpu | /optimize restore | /optimize memory | /optimize memory unload"
+
+
 def run_cli():
     start_runtime()
     schedule_idle_check()
 
     now = datetime.now(ZoneInfo(KOOKIE_TZ)).strftime("%A, %B %d, %Y at %I:%M %p")
     print(f"\nKookie is running (Cambodia time: {now}).")
-    print("Type 'exit' to stop.\n")
+    print("Type '/quit' or 'exit' to stop.\n")
 
     queued = collections.deque()
     try:
@@ -15194,7 +15531,7 @@ def run_cli():
                     # Ctrl+D or Ctrl+C is a normal way to leave; not a crash.
                     print()
                     break
-                if user.lower() in ["exit", "quit"]:
+                if user.strip().lower() in {"exit", "quit", "/quit"}:
                     break
                 # Handled before she is asked anything: these are switches for
                 # where she answers, not questions to think about. Asking her
@@ -15215,6 +15552,9 @@ def run_cli():
                 # about. Handing them to the model would spend a generation to
                 # be told to run the command that was already typed.
                 command = user.strip().split()
+                if command and command[0].lower() in ("/resources", "/system", "/optimize"):
+                    print(handle_resource_command(user))
+                    continue
                 if command and command[0].lower() in ("/learn", "/export", "/opinion", "/restart", "/memory", "/webmemory"):
                     verb = command[0].lower()
                     if verb == "/restart":
