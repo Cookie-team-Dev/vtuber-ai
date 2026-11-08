@@ -5223,6 +5223,93 @@ def format_memory_note(item, max_chars=220):
     return f"- [{stamp or 'earlier'}] {text}"
 
 
+def trading_portfolio():
+    """What Kookie's virtual wallet is worth right now."""
+    try:
+        import trading
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    return trading.format_portfolio()
+
+
+def trading_buy(asset, usd):
+    """Buy a little of an asset with play money."""
+    try:
+        import trading
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    return trading.buy(str(asset).strip(), float(usd))
+
+
+def trading_sell(asset, usd=None):
+    """Sell some of an asset for play money."""
+    try:
+        import trading
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    amount = float(usd) if usd is not None else None
+    return trading.sell(str(asset).strip(), amount_usd=amount)
+
+
+def trading_history(limit=10):
+    """Recent trade history."""
+    try:
+        import trading
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    return trading.trade_history(limit=int(limit))
+
+
+def game_supported():
+    """Which games Kookie can play, in one line."""
+    try:
+        import game_ai
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    return game_ai.list_supported_games()
+
+
+def game_state():
+    """Whether Kookie is currently in a game and which one."""
+    try:
+        import game_ai
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    state = game_ai.get_game_state()
+    return f"Game: {state.get('game') or 'none'} (can act: {state.get('can_act', False)})"
+
+
+def game_stop():
+    """Stop whatever game Kookie is playing."""
+    try:
+        import game_ai
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    return game_ai.stop_game()
+
+
+def sleep_state():
+    """Whether Kookie is sleeping and whether it is time to consolidate."""
+    try:
+        import sleep_consolidation
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    return (
+        f"sleeping: {sleep_consolidation.is_sleeping()}, "
+        f"due: {sleep_consolidation.should_consolidate()}"
+    )
+
+
+def skills_list():
+    """The skills Kookie has taught herself."""
+    try:
+        import kookie_skills
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Error: {error}"
+    skills = kookie_skills.Skills()
+    return skills.list_skills()
+
+
 # With the 16K context window, there is room for much more conversation history.
 # 16 exchanges instead of 8: a bigger model can track pronouns and references
 # across more turns, so the transcript can be longer without losing coherence.
@@ -10765,6 +10852,15 @@ TOOL_FUNCTIONS = {
     "memory_search": lambda arg: memory_search(arg),
     "forget_memory": lambda arg: forget_memory(arg),
     "memory_summary": lambda arg: memory_summary(),
+    "trading_portfolio": lambda arg: trading_portfolio(),
+    "trading_buy": lambda arg: trading_buy(*_split_pipe(arg, 2)),
+    "trading_sell": lambda arg: trading_sell(*_split_pipe(arg, 2)),
+    "trading_history": lambda arg: trading_history(int(arg) if arg and arg.isdigit() else 10),
+    "game_supported": lambda arg: game_supported(),
+    "game_state": lambda arg: game_state(),
+    "game_stop": lambda arg: game_stop(),
+    "sleep_state": lambda arg: sleep_state(),
+    "skills_list": lambda arg: skills_list(),
     "calculate": lambda arg: maths.calculate(arg),
     "math": lambda arg: maths.calculate(arg),
     "click_at": lambda arg: click_at(*[int(x) if x.isdigit() else x for x in arg.split(",")]) if "," in arg else "Error: click_at requires 'x,y'",
