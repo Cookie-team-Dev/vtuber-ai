@@ -5307,7 +5307,14 @@ def skills_list():
     except Exception as error:  # noqa: BLE001 - surface to the caller
         return f"Error: {error}"
     skills = kookie_skills.Skills()
-    return skills.list_skills()
+    listing = skills.list_skills()
+    if not isinstance(listing, dict) or not listing:
+        return "No skills taught yet."
+    lines = []
+    for name, spec in listing.items():
+        desc = str(spec.get("description", "")).strip()
+        lines.append(f"- {name}: {desc}")
+    return "\n".join(lines)
 
 
 # With the 16K context window, there is room for much more conversation history.
@@ -10861,6 +10868,7 @@ TOOL_FUNCTIONS = {
     "game_stop": lambda arg: game_stop(),
     "sleep_state": lambda arg: sleep_state(),
     "skills_list": lambda arg: skills_list(),
+    "web_search": lambda arg: __import__("web_search_helper").search_text(arg),
     "calculate": lambda arg: maths.calculate(arg),
     "math": lambda arg: maths.calculate(arg),
     "click_at": lambda arg: click_at(*[int(x) if x.isdigit() else x for x in arg.split(",")]) if "," in arg else "Error: click_at requires 'x,y'",
