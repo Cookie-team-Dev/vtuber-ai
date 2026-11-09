@@ -13319,7 +13319,7 @@ def warm_prompt_cache_in_background():
     return thread
 
 
-def chat_system_prompt(message="", tools_enabled=False, emotion_options="", voice_mode=False):
+def chat_system_prompt(message="", tools_enabled=False, emotion_options="", voice_mode=False, focused=False):
     """Her rules for an ordinary reply, as one string.
 
     A function rather than an f-string inside ask_ai so the startup warmup can
@@ -13328,6 +13328,13 @@ def chat_system_prompt(message="", tools_enabled=False, emotion_options="", voic
     and the old part of the memory block, both of which are unchanged from one
     message to the next, so a warmup with this text is what makes the first real
     reply as quick as the hundredth.
+
+    `focused` is true for a maths question. The full personality block is about
+    5,000 tokens of VTuber-daughter rules, and on a maths question none of it
+    changes the answer - it just eats the context window the working steps need.
+    Focused mode keeps the read-the-message rule and the envelope rules, drops
+    the personality, and adds a short "show your work" instruction instead. The
+    answer is the same either way; this is about giving the model room to think.
     """
     voice_rules = (
         ""
@@ -13343,6 +13350,20 @@ def chat_system_prompt(message="", tools_enabled=False, emotion_options="", voic
             "Be warm, natural, and conversational, like you're really there with them. "
         )
     )
+    if focused:
+        system = (
+            READ_THE_MESSAGE_RULES
+            + voice_rules
+            + FOCUS_RULES
+            + (
+                "LEAVE THE ENVELOPE ALONE on an ordinary reply: thinking_summary is empty "
+                "unless she asks how you worked something out, and singing, song_lyrics and "
+                "song_name stay empty unless you are really singing. Her reply is the whole "
+                "budget. "
+            )
+            + (TOOL_PROMPT if tools_enabled else "")
+        )
+        return system
     system = (
         # First, because everything after it is about how to talk and none of it
     # outranks what she was actually asked. See READ_THE_MESSAGE_RULES.
@@ -13516,6 +13537,22 @@ MATH_RULES = (
     "When the tool hands you an answer, that is the answer: use its number, and if "
     "it says it could not work it out, say you could not work it out rather than "
     "filling the gap yourself."
+)
+
+# A second, much smaller rule set for the one kind of question where her
+# personality is pure overhead: a maths problem. The full personality block is
+# ~5,000 tokens of warm VTuber daughter rules, and on a maths question none of
+# it changes the answer - it just eats the context window that the working
+# steps need. Focused mode drops the personality, the empathy register and the
+# conversation style, keeps the read-the-message rule and the envelope rules,
+# and adds a short "show your work" instruction instead. The answer is the same
+# either way; this is about giving the model room to think.
+FOCUS_RULES = (
+    "FOCUS MODE: this is a maths question. Answer it directly and show your "
+    "working in a few short lines. Do not greet, do not deflect, do not add "
+    "personality or emotion to the answer. Use the MATHS rule above: the number "
+    "in the MATHS, ALREADY WORKED OUT block is the answer - say it plainly and "
+    "do not recalculate it yourself."
 )
 
 
@@ -13707,8 +13744,16 @@ def ask_ai(
     # avatar actually knows how to wear.
     emotion_options = ", ".join(sorted(EMOTIONS))
 
+    # A maths question is the one place where her whole personality is pure
+    # overhead: none of the VTuber-daughter rules change the answer, and the
+    # full block is about 5,000 tokens - nearly the whole context window. On a
+    # maths question she gets the focused rule set instead, which keeps the
+    # read-the-message rule and the envelope rules and drops the rest, so the
+    # model has room to work through the problem. The answer is the same.
+    focused = bool(MATH_REQUEST_PATTERN.search(str(message or "")))
+
     system = chat_system_prompt(
-        message, tools_enabled, emotion_options, voice_mode=voice_mode
+        message, tools_enabled, emotion_options, voice_mode=voice_mode, focused=focused
     )
     now_str = datetime.now(ZoneInfo(KOOKIE_TZ)).strftime("%A, %B %d, %Y at %I:%M %p")
     # One builder for both prompt kinds: chat and idle thinking read the same

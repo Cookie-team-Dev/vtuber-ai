@@ -2,6 +2,7 @@ import io
 import importlib
 import logging
 import os
+import queue as queue_module
 import re
 import shutil
 import subprocess
@@ -227,6 +228,94 @@ def _synthesize_with_cli(text, wav_path, length_scale):
     )
 
 
+def _split_into_sentences(text):
+    """Split text into speakable sentences without breaking numbers.
+
+    A naive split on [.!?] mangles "22.5 degrees" into "22" and "5 degrees"
+    and turns "Dr. Smith" into "Dr" and "Smith". The Laya voice assistant
+    solved this by protecting the boundary first, so the pipeline below can
+    start synthesizing the next sentence while the current one is still
+    playing and never cut a number in half.
+    """
+    if not text:
+        return []
+    protected = text
+    # A period between digits is a decimal, not a sentence end.
+    protected = re.sub(r"(\d)\.(\d)", r"\1<DEC>\2", protected)
+    # A period following a known abbreviation is not a sentence end either. The
+    # boundary after the dot has to be a lookahead rather than \b: a dot next
+    # to a space is not a word boundary, so \b silently failed and every
+    # "Dr." was still treated as a sentence end.
+    for abbrev in ("Mr", "Mrs", "Ms", "Dr", "Prof", "Sr", "Jr", "St", "Lt",
+                   "Capt", "Sgt", "Rev", "Hon", "e.g", "i.e", "vs", "etc",
+                   "Inc", "Ltd", "Co", "Corp", "al", "a.m", "p.m"):
+        protected = re.sub(
+            r"\b" + abbrev + r"\.(?=\s|$)", abbrev + "<ABBREV>", protected
+        )
+    raw = re.split(r"(?<=[.!?])\s+", protected.strip())
+    sentences = []
+    for chunk in raw:
+        chunk = chunk.replace("<DEC>", ".").replace("<ABBREV>", ".").strip()
+        if chunk:
+            sentences.append(chunk)
+    return sentences
+
+
+def _speak_pipelined(sentences, emotion, intensity, amika_emotion):
+    """Play sentence N while synthesizing sentence N+1 in the background.
+
+    The old path synthesized the whole reply, then played it, so time-to-first-
+    audio was the full length of the TTS call. A person hears nothing until the
+    entire line is ready. The pipeline keeps a single prefetch thread running
+    ahead of the player: as soon as a sentence is synthesized it is queued,
+    and the player starts the next WAV the instant the current one finishes.
+    stop_speaking sets the stop flag, so a barge-in stops the player and the
+    prefetch thread instead of waiting for the line to end.
+    """
+    if not sentences:
+        return
+
+    _PIPELINE_STOP.clear()
+    queue = queue_module.Queue()
+
+    def _prefetch():
+        for sentence in sentences:
+            if _PIPELINE_STOP.is_set():
+                return
+            audio_path = _synthesize_to_file(
+                sentence, emotion, intensity, amika_emotion
+            )
+            if audio_path is None:
+                continue
+            queue.put(audio_path)
+        queue.put(None)  # sentinel: synthesis is done
+
+    prefetch_thread = threading.Thread(target=_prefetch, daemon=True)
+    prefetch_thread.start()
+
+    try:
+        while True:
+            item = queue.get()
+            if item is None:
+                break
+            if _PIPELINE_STOP.is_set():
+                try:
+                    os.unlink(item)
+                except OSError:
+                    pass
+                break
+            try:
+                _play_synthesized_audio(item)
+            finally:
+                try:
+                    os.unlink(item)
+                except OSError:
+                    pass
+    finally:
+        _PIPELINE_STOP.set()
+        prefetch_thread.join(timeout=2)
+
+
 def speak(text, emotion="neutral", intensity=0.5):
     if not VOICE_ENABLED or not text or not text.strip():
         return
@@ -237,7 +326,6 @@ def speak(text, emotion="neutral", intensity=0.5):
         intensity = 0.5
 
     segments = parse_speech_codes(text, emotion)
-    played_audio = False
     for kind, content, segment_emotion in segments:
         if kind == "sfx":
             sfx_path = find_sfx_file(content)
@@ -254,7 +342,6 @@ def speak(text, emotion="neutral", intensity=0.5):
                     timeout=15,
                     start_new_session=True,
                 )
-                played_audio = True
             except subprocess.TimeoutExpired:
                 log.warning("Sound-effect playback timed out for %s", content)
             except (subprocess.CalledProcessError, FileNotFoundError, RuntimeError) as error:
@@ -264,55 +351,82 @@ def speak(text, emotion="neutral", intensity=0.5):
         spoken = sanitize_for_speech(content)
         if not spoken:
             continue
-        if played_audio:
-            time.sleep(0.2)
-            played_audio = False
-        _speak_text(
-            spoken,
-            piper_emotion(segment_emotion),
-            intensity,
-            amika_emotion=segment_emotion,
-        )
+        # A reply is usually several sentences. The pipeline starts the next
+        # sentence's synthesis while the current one is still playing, so the
+        # first sound arrives as soon as the first WAV is ready instead of at
+        # the end of the whole line. A single sentence or a failure to split
+        # falls back to the direct path, which is unchanged.
+        sentences = _split_into_sentences(spoken)
+        if len(sentences) <= 1:
+            _speak_text(
+                spoken,
+                piper_emotion(segment_emotion),
+                intensity,
+                amika_emotion=segment_emotion,
+            )
+        else:
+            _speak_pipelined(
+                sentences,
+                piper_emotion(segment_emotion),
+                intensity,
+                segment_emotion,
+            )
 
 
-def _speak_text(spoken, emotion, intensity, amika_emotion="neutral"):
-    """Prefer OpenAmika GPT-SoVITS, falling back to Piper for this segment."""
+def _synthesize_to_file(spoken, emotion, intensity, amika_emotion="neutral"):
+    """Synthesize one chunk to a WAV path and return it, or None on failure.
+
+    This is the shared body of _speak_text and the pipelined speak path: the
+    pipeline needs to hand a finished WAV to a second thread while the first
+    thread is still playing, so synthesis has to be a function that returns a
+    path rather than one that plays inline. The caller owns the temp file and
+    must unlink it.
+    """
     target_scale = VOICE_LENGTH_SCALES.get(str(emotion).casefold(), 1.0)
     length_scale = (1.0 + (target_scale - 1.0) * intensity) * TTS_SPEED
 
-    audio_path = None
+    fd, audio_path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
     try:
-        fd, audio_path = tempfile.mkstemp(suffix=".wav")
-        os.close(fd)
         try:
             _synthesize_with_amika(spoken, amika_emotion, audio_path)
-        except Exception as error:
+        except Exception:
             global _AMIKA_WARNED
             if not _AMIKA_WARNED:
                 _AMIKA_WARNED = True
                 print("OpenAmika TTS unavailable; using Piper.", flush=True)
-        else:
-            _play_synthesized_audio(audio_path)
-            return
-
-        try:
-            _synthesize_with_piper(spoken, audio_path, length_scale)
-        except Exception:
-            # Any problem with the in-process API falls back to the CLI.
             try:
-                _synthesize_with_cli(spoken, audio_path, length_scale)
-            except subprocess.TimeoutExpired:
-                log.warning("Piper CLI timed out while synthesizing speech")
-                return
-            except (subprocess.CalledProcessError, FileNotFoundError, ModuleNotFoundError):
-                return
+                _synthesize_with_piper(spoken, audio_path, length_scale)
+            except Exception:
+                try:
+                    _synthesize_with_cli(spoken, audio_path, length_scale)
+                except subprocess.TimeoutExpired:
+                    log.warning("Piper CLI timed out while synthesizing speech")
+                    return None
+                except (subprocess.CalledProcessError, FileNotFoundError, ModuleNotFoundError):
+                    return None
+        return audio_path
+    except Exception:
+        log.warning("Synthesis failed for %r", spoken[:40], exc_info=True)
+        try:
+            os.unlink(audio_path)
+        except OSError:
+            pass
+        return None
+
+
+def _speak_text(spoken, emotion, intensity, amika_emotion="neutral"):
+    """Prefer OpenAmika GPT-SoVITS, falling back to Piper for this segment."""
+    audio_path = _synthesize_to_file(spoken, emotion, intensity, amika_emotion)
+    if audio_path is None:
+        return
+    try:
         _play_synthesized_audio(audio_path)
     finally:
-        if audio_path:
-            try:
-                os.unlink(audio_path)
-            except OSError:
-                pass
+        try:
+            os.unlink(audio_path)
+        except OSError:
+            pass
 
 
 def _synthesize_with_amika(text, emotion, wav_path):
@@ -449,17 +563,31 @@ def synthesize_for_voice_chat(text, wav_path):
 
 
 def _play_synthesized_audio(audio_path):
+    """Play one WAV, tracking the process so stop_speaking can kill it.
+
+    The old version ran the player with check=True and swallowed every error,
+    so a barge-in had nothing to kill and the line played out. The process is
+    tracked here and released when it exits, so stop_speaking can cut it off
+    mid-sentence instead of waiting for the sentence to finish.
+    """
     try:
-        subprocess.run(
+        proc = subprocess.Popen(
             audio_player(audio_path),
-            check=True,
-            timeout=120,
             start_new_session=True,
         )
+    except (subprocess.CalledProcessError, FileNotFoundError, RuntimeError):
+        return
+    _track_playback(proc)
+    try:
+        proc.wait(timeout=120)
     except subprocess.TimeoutExpired:
         log.warning("Audio playback timed out")
-    except (subprocess.CalledProcessError, FileNotFoundError, RuntimeError):
-        pass
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    finally:
+        _clear_playback(proc)
 
 
 def _read_wav(path):
@@ -621,65 +749,55 @@ def _sing_fragment_via_cli(text, length_scale):
 
 _AMIKA_SERVER_PROC = None
 
+# The currently-playing audio process, if any. stop_speaking kills it so a
+# person can cut her off mid-sentence; without this she finishes the line.
+_PLAYBACK_PROC = None
+_PLAYBACK_LOCK = threading.Lock()
+
+# The pipeline's stop flag. stop_speaking sets this so a barge-in halts both
+# the player and the prefetch thread instead of waiting for the line to end.
+_PIPELINE_STOP = threading.Event()
+
+
+def _track_playback(proc):
+    """Remember the active player so stop_speaking can kill just it."""
+    global _PLAYBACK_PROC
+    with _PLAYBACK_LOCK:
+        _PLAYBACK_PROC = proc
+
+
+def _clear_playback(proc):
+    global _PLAYBACK_PROC
+    with _PLAYBACK_LOCK:
+        if _PLAYBACK_PROC is proc:
+            _PLAYBACK_PROC = None
+
 
 def stop_speaking():
-    """Stop all speech playback."""
-    interrupt()
-    """Sing a short line."""
-    try:
-        sing_song([text], emotion="happy", intensity=0.7)
-    except Exception:
-        pass
-    """Speak a short emotion cue."""
-    cues = {"happy": "yay!", "sad": "aww...", "angry": "hmph!", "surprised": "oh!"}
-    try:
-        speak(cues.get(emotion, "hmm"), emotion=emotion, intensity=0.7)
-    except Exception:
-        pass
-    """Speak a recalled memory aloud."""
-    try:
-        speak(text, emotion="curious", intensity=0.6)
-    except Exception:
-        pass
-    """Play a touch reaction vocalization."""
-    try:
-        import vocalizations
-        v = vocalizations.vocalize(context="affection", emotion="happy")
-        if v:
-            speak(v, emotion="happy", intensity=0.7)
-    except Exception:
-        pass
-    """Speak a greeting on startup."""
-    try:
-        speak(text, emotion="happy", intensity=0.8)
-    except Exception:
-        pass
-    """Stop current speech immediately (voice interruption)."""
-    global _AMIKA_WARNED
-    try:
-        import subprocess
-        subprocess.run(["pkill", "-f", "paplay"], capture_output=True)
-        subprocess.run(["pkill", "-f", "aplay"], capture_output=True)
-        subprocess.run(["pkill", "-f", "ffplay"], capture_output=True)
-    except Exception:
-        pass
-    global _AMIKA_SERVER_PROC
-    if _AMIKA_SERVER_PROC is not None:
-        return
-    tts_dir = Path(__file__).resolve().parent / "openamika" / "vendor" / "tts-engine"
-    venv_python = tts_dir / ".venv" / "bin" / "python"
-    if not venv_python.exists():
+    """Stop all speech playback immediately.
+
+    This is the barge-in path: Mommy starts talking while Kookie is still
+    speaking and the line has to die on the spot, not at the end of the
+    sentence. The old body called interrupt(), which does not exist here, so
+    every stop raised NameError and nothing was ever silenced; it also carried
+    leftover fragments of sing_song, speak_cue and say_greeting that referenced
+    parameters no caller passes, so even the first line was dead code.
+    """
+    global _PLAYBACK_PROC
+    _PIPELINE_STOP.set()
+    with _PLAYBACK_LOCK:
+        proc = _PLAYBACK_PROC
+        _PLAYBACK_PROC = None
+    if proc is None:
         return
     try:
-        _AMIKA_SERVER_PROC = subprocess.Popen(
-            [str(venv_python), "main.py", "--port", "8002", "--host", "127.0.0.1"],
-            cwd=str(tts_dir),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
+        proc.kill()
     except Exception:
-        _AMIKA_SERVER_PROC = None
+        pass
+    try:
+        proc.wait(timeout=2)
+    except Exception:
+        pass
 def _sing_lines_as_speech(lines, emotion, intensity):
     """Last resort: read the lyrics out instead of dropping the song."""
     target_scale = VOICE_LENGTH_SCALES.get(str(emotion).casefold(), 1.0)
