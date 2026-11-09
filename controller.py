@@ -423,7 +423,15 @@ OLLAMA_REPLY_SCHEMA = {
 # Prompt processing is the memory spike: one batch of 256 tokens at a time on a
 # box this size is what tips it into swapping. Half a batch trades a little
 # prompt speed for a load that actually fits.
-OLLAMA_BATCH = 128
+# num_batch, the chunk size Ollama processes at once. 128 was the safe floor on
+# a 7.5 GiB box with the full 13.6k-char prompt: measured cold-cache at 141s with
+# no swap. After trimming the prompt to ~13.2k chars (see the merge of
+# CONVERSATION_RULES/EMPATHY_RULES/CLARITY_RULES above) the same request at
+# batch 512 ran in 116s and the box stayed out of swap, so 512 is now the
+# default. The prompt is the thing that decides whether this fits: if the rules
+# grow again past ~14k chars, drop this back to 256 rather than let the box
+# swap. Set KOOKIE_OLLAMA_BATCH to override.
+OLLAMA_BATCH = int(os.environ.get("KOOKIE_OLLAMA_BATCH", "512"))
 
 # ------------------------------------------------- when the box is the problem
 #
