@@ -60,6 +60,17 @@ _MODEL_CACHE = {}  # env_var -> (tuple of model ids, expiry monotonic time)
 _MODEL_TTL_SECONDS = 3600  # refresh the model list once an hour
 _MODEL_FAIL_TTL_SECONDS = 600  # don't retry a failed discovery for 10 minutes
 
+# The probe costs 8.5s the first time, and the cache is per-process, so a Kookie
+# restart paid it again on the first reply. The result is written to disk in the
+# same state directory the launcher uses for the Amika log, so it survives a
+# restart and the first reply after one is quick instead of cold. A corrupt or
+# stale file is ignored - it is a cache, not a config, and falling back to a
+# fresh probe is the correct behaviour when it cannot be trusted.
+_MODEL_CACHE_FILE = os.path.join(
+    os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")),
+    "kookie", "fastai_models.json",
+)
+
 # Don't print the same key error more than once per dedup window. chat() can be
 # called more than once for the same message (initial attempt, then retry after
 # Ollama fails), and without this every key's refusal is logged twice.
@@ -267,6 +278,57 @@ def _probe_live_models(base_url, key, models, label):
     return live
 
 
+def _load_model_cache():
+    """Restore the probed model list from disk, if it is still fresh.
+
+    The probe costs 8.5s and the in-memory cache does not survive a restart, so
+    a Kookie that had just come up paid it again on the first reply. The file
+    lives in the same state directory as the Amika log and carries a monotonic
+    expiry, so a stale or corrupt file is simply ignored and a fresh probe runs.
+    """
+    try:
+        with open(_MODEL_CACHE_FILE, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        if not isinstance(data, dict):
+            return
+        now = time.monotonic()
+        for env_var, entry in data.items():
+            if not isinstance(entry, dict):
+                continue
+            models = entry.get("models")
+            expires = entry.get("expires")
+            if not isinstance(models, list) or not isinstance(expires, (int, float)):
+                continue
+            if expires > now:
+                _MODEL_CACHE[env_var] = (tuple(models), float(expires))
+    except (OSError, ValueError, TypeError):
+        # A cache is a hint, not a contract. Missing, corrupt or unreadable
+        # means "probe again", which is the same work the first reply would do.
+        pass
+
+
+def _save_model_cache():
+    """Persist the probed model list so a restart does not re-probe."""
+    try:
+        directory = os.path.dirname(_MODEL_CACHE_FILE)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        payload = {}
+        for env_var, (models, expires) in _MODEL_CACHE.items():
+            if expires > time.monotonic():
+                payload[env_var] = {"models": list(models), "expires": expires}
+        if not payload:
+            return
+        tmp = _MODEL_CACHE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+        os.replace(tmp, _MODEL_CACHE_FILE)
+    except OSError:
+        # Disk full, read-only filesystem, state dir unwritable: none of these
+        # is worth breaking a reply over. The in-memory cache still works.
+        pass
+
+
 def _discover_models(env_var, base_url, models, label):
     """Return the model tuple for one provider: discovered first, static second.
 
@@ -285,6 +347,13 @@ def _discover_models(env_var, base_url, models, label):
     cached = _MODEL_CACHE.get(env_var)
     if cached and cached[1] > now:
         return cached[0]
+    # The first discovery call in a process loads the disk cache so a restart
+    # does not pay the 8.5s probe again on the very first reply.
+    if not _MODEL_CACHE:
+        _load_model_cache()
+        cached = _MODEL_CACHE.get(env_var)
+        if cached and cached[1] > now:
+            return cached[0]
 
     # keys_for splits the comma/space-separated list; _key_for would return the
     # whole blob as one key and every discovery call would 401.
@@ -308,12 +377,14 @@ def _discover_models(env_var, base_url, models, label):
         merged = _probe_live_models(base_url, key, merged, label)
         result = tuple(merged)
         _MODEL_CACHE[env_var] = (result, now + _MODEL_TTL_SECONDS)
+        _save_model_cache()
         return result
 
     # Discovery failed or returned nothing: cache the static list briefly so
     # we do not hammer the provider's /models endpoint on every reply.
     result = tuple(models)
     _MODEL_CACHE[env_var] = (result, now + _MODEL_FAIL_TTL_SECONDS)
+    _save_model_cache()
     print(f"fastai: model discovery failed for {label}, using static list "
           f"(retry in {_MODEL_FAIL_TTL_SECONDS // 60}m)")
     return result

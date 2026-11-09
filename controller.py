@@ -613,7 +613,8 @@ def trim_prompt_to_budget(segments):
     too long, so the budget is enforced here instead of trusted to the prose staying
     short.
     """
-    if estimate_prompt_tokens(segments) <= PROMPT_TOKEN_BUDGET:
+    tokens = estimate_prompt_tokens(segments)
+    if tokens <= PROMPT_TOKEN_BUDGET:
         return segments
 
     for name in PROMPT_TRIMMABLE:
@@ -13557,12 +13558,32 @@ def autonomous_text(text):
 
 
 def _omniroute_generate(system, prompt, on_text=None, timeout=120):
-    """Generate a reply via Omniroute, falling back to OpenRouter."""
+    """Generate a reply via the hosted fast model, falling back to Omniroute.
+
+    fastai is tried first because it is the one that works here: the Gemini keys
+    answer in well under a second once discovery is fixed, while the local
+    Omniroute server on port 20128 is up but demands auth (401) and has no
+    binary to start itself, so asking it first burned the full timeout on every
+    reply before fastai ever got a chance. Measured: 6.2s of dead timeout, then
+    0.66s of real answer. Order matters, and fastai.available() is the cheap
+    check that decides whether the detour is worth taking at all.
+    """
     messages = []
     messages.append({"role": "system", "content": "You are Kookie, a warm vtuber companion. Answer in one short sentence. Be helpful and direct."})
     messages.append({"role": "user", "content": prompt})
     global _OMNIROUTE_USED
     _OMNIROUTE_USED = False
+    try:
+        import fastai
+        if fastai.available():
+            result = fastai.chat(messages, max_tokens=256, temperature=0.7, json_mode=False, timeout=timeout)
+            text = result.get("text", "") if isinstance(result, dict) else str(result)
+            if text:
+                if on_text:
+                    on_text(text)
+                return json.dumps({"reply": text, "emotion": "happy"}), "stop"
+    except Exception as error:
+        print("OpenRouter request failed:", error)
     try:
         import omniroute
         result = omniroute.chat(messages, max_tokens=256, temperature=0.7, json_mode=False, timeout=timeout, model="auto/best-chat")
@@ -13574,16 +13595,6 @@ def _omniroute_generate(system, prompt, on_text=None, timeout=120):
             return json.dumps({"reply": text, "emotion": "happy"}), "stop"
     except Exception as error:
         print("Omniroute request failed:", error)
-    try:
-        import fastai
-        result = fastai.chat(messages, max_tokens=256, temperature=0.7, json_mode=False, timeout=timeout)
-        text = result.get("text", "") if isinstance(result, dict) else str(result)
-        if text:
-            if on_text:
-                on_text(text)
-            return json.dumps({"reply": text, "emotion": "happy"}), "stop"
-    except Exception as error:
-        print("OpenRouter request failed:", error)
     return None, "error"
 
 def ask_ai(
