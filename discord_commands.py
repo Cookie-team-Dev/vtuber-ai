@@ -416,7 +416,7 @@ def register_slash_commands(tree: app_commands.CommandTree):
         if client is None:
             await interaction.followup.send(f"Could not join: {err}", ephemeral=True)
             return
-        from discord_bot import get_voice_enabled
+        from discord_bot import get_voice_enabled, _VOICE_CLIENTS
         get_voice_enabled().add(guild_id)
         print(f"[VOICE CMD] Added guild {guild_id} to _VOICE_ENABLED: {list(get_voice_enabled())}")
         listen_ok = False
@@ -645,6 +645,16 @@ async def maybe_switch(text: str, message, label: str) -> bool:
             else "I'm not on Discord right now.",
             speak=False,
         )
+        return True
+
+    if action == "activity":
+        answer = await __import__("asyncio").to_thread(controller.discord_switch_command, text)
+        await _get_speak()(channel, answer, speak=False)
+        return True
+
+    if action == "email":
+        answer = await __import__("asyncio").to_thread(controller.check_email)
+        await _get_speak()(channel, answer, speak=False)
         return True
 
     if action == "start":

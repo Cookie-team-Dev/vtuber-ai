@@ -27,6 +27,7 @@ import re
 import threading
 import time
 import logging
+import tempfile
 
 from memory import _contains_slur
 
@@ -228,22 +229,56 @@ def load(filepath=None):
             _corpus_keys.clear()
             for row in _state["corpus"]:
                 _remember_corpus_key(row)
-    except (OSError, ValueError, TypeError):
-        logging.exception("learning: failed to load state")
+    except FileNotFoundError:
         return
+    except json.JSONDecodeError as error:
+        logging.warning("learning: state file %s is empty or invalid JSON (%s)", path, error)
+    except (OSError, ValueError, TypeError) as error:
+        logging.warning("learning: could not load state file %s: %s", path, error)
 
 
 def save(filepath=None):
     """Write her learning out. A failure here must never cost her a reply."""
     path = filepath or LEARNING_FILE
-    with _lock:
+    from kookie_resilience import CircuitBreaker
+
+    breaker = CircuitBreaker(
+        "learning",
+        cooldown_seconds=0.0,
+        attempts=3,
+        delay_seconds=0.05,
+        threshold=1,
+        is_transient=lambda error: isinstance(error, OSError),
+    )
+
+    def _write():
         payload = {key: _state[key] for key in ("facts", "opinions", "preferences", "goals", "corpus", "stats")}
-    try:
-        with open(path, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2)
-        return True
-    except OSError:
-        return False
+        temp_path = None
+        try:
+            directory = os.path.dirname(os.path.abspath(path))
+            fd, temp_path = tempfile.mkstemp(prefix=".kookie-learning-", suffix=".tmp", dir=directory)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, path)
+            temp_path = None
+            return True
+        except OSError:
+            raise
+        finally:
+            if temp_path is not None:
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
+
+    with _lock:
+        try:
+            return breaker.call(_write)
+        except OSError as error:
+            logging.warning("learning: could not save state file %s: %s", path, error)
+            return False
 
 
 def _corpus_fingerprint(row):

@@ -36,6 +36,8 @@ import time
 import urllib.request
 import urllib.parse
 
+import content_filter
+
 # Patch discord.ext.voice_recv.reader.AudioReader.stop so a self-stop - which
 # is what the voice_recv router does when its reader finishes - does not get
 # mistaken for the client dying. The original behaviour is kept; only the
@@ -431,7 +433,7 @@ async def _voice_leave(guild_id):
 
 
 async def _voice_speak(channel, text):
-    """Synthesize text with Piper and play it in the channel's voice chat."""
+    """Synthesize text with Amika (or Piper fallback) for channel voice chat."""
     if not text or not text.strip():
         return None
     guild_id = getattr(getattr(channel, "guild", None), "id", None)
@@ -447,9 +449,7 @@ async def _voice_speak(channel, text):
     try:
         fd, wav_path = tempfile.mkstemp(suffix=".wav")
         os.close(fd)
-        await asyncio.to_thread(
-            voice._synthesize_with_piper, spoken, wav_path, 1.0
-        )
+        await asyncio.to_thread(voice.synthesize_for_voice_chat, spoken, wav_path)
         if not os.path.isfile(wav_path) or os.path.getsize(wav_path) == 0:
             return None
         audio = discord.FFmpegPCMAudio(wav_path)
@@ -557,8 +557,9 @@ def ask_with_tools(text, on_reply_text=None, context_note="", speaker_name=None,
     loses them: she comes back from reading a file with no idea that "no, tell
     daddy" was still waiting to be answered.
     """
+    filtered_text = content_filter.filter_input(text)
     result = controller.ask_ai(
-        text,
+        filtered_text,
         on_reply_text=on_reply_text,
         context_note=context_note,
         speaker_name=speaker_name,
@@ -593,8 +594,9 @@ def ask_with_tools(text, on_reply_text=None, context_note="", speaker_name=None,
                 "Answer the message from that result now, "
                 "without calling any tool again.\n\n"
             )
+            filtered_text = content_filter.filter_input(text)
             result = controller.ask_ai(
-                text,
+                filtered_text,
                 context_note=f"{context_note}\n\n{repeat_hint}" if context_note else repeat_hint,
                 speaker_name=speaker_name,
                 speaker_is_owner=speaker_is_owner,
@@ -614,8 +616,9 @@ def ask_with_tools(text, on_reply_text=None, context_note="", speaker_name=None,
             f"looks wrong or incomplete.\n\nTool result from {name}"
             f"({value[:80]}...):\n{outcome}\n\n"
         )
+        filtered_text = content_filter.filter_input(text)
         result = controller.ask_ai(
-            text,
+            filtered_text,
             context_note=f"{context_note}\n\n{hint}" if context_note else hint,
             speaker_name=speaker_name,
             speaker_is_owner=speaker_is_owner,
@@ -856,6 +859,23 @@ async def think_and_reply(channel, label, text, user_id=None, burst_note=""):
         if len(full_reply) > MESSAGE_LIMIT:
             full_reply = full_reply[:MESSAGE_LIMIT].rsplit(" ", 1)[0] + "..."
         await _speak_into(channel, full_reply, speak=True)
+    # If she wrote a file (code Mommy asked for), send it as a Discord attachment.
+    _file = result.get("file") if isinstance(result, dict) else None
+    if isinstance(_file, dict):
+        _fname = str(_file.get("filename", "kookie_code.txt")).strip()
+        _content = _file.get("content", "")
+        if _content:
+            import io as _io
+            _bytes = str(_content).encode("utf-8")
+            _discord_file = discord.File(_io.BytesIO(_bytes), filename=_fname)
+            try:
+                await channel.send(
+                    f"Here's the code you asked for — `{_fname}`:",
+                    file=_discord_file,
+                    allowed_mentions=NO_PINGS,
+                )
+            except discord.HTTPException as _error:
+                print("Discord bot: could not send code file:", _error)
 
 
 def _one_turn(text, on_reply_text=None, context_note="", speaker_name=None, speaker_is_owner=True, speaker_id=None):
@@ -1060,6 +1080,33 @@ def classify(message):
     if ALLOWED_USERS and author.id not in ALLOWED_USERS:
         return None
     content = message.content or ""
+    # Discord GIFs and images arrive as attachments, not text. Pull their
+    # URLs into the message so the model can see them through the same
+    # eyes it uses for any other image or video link.
+    attachments = getattr(message, "attachments", None) or []
+    for att in attachments:
+        url = getattr(att, "url", None) or getattr(att, "proxy_url", None)
+        if url:
+            if content:
+                content = content + " " + url
+            else:
+                content = url
+    # Discord also sends GIFs as embeds (Tenor/Giphy). Pull the
+    # image URL out of each embed so the model can see those too.
+    for embed in getattr(message, "embeds", None) or []:
+        url = None
+        image = getattr(embed, "image", None)
+        if image is not None:
+            url = getattr(image, "url", None) or getattr(image, "proxy_url", None)
+        if not url:
+            thumbnail = getattr(embed, "thumbnail", None)
+            if thumbnail is not None:
+                url = getattr(thumbnail, "url", None) or getattr(thumbnail, "proxy_url", None)
+        if url and url not in content:
+            if content:
+                content = content + " " + url
+            else:
+                content = url
 
     # A ping of her, by id or by the raw token, is an address. Comparing the
     # mention objects the library hands back is how "she never notices she was

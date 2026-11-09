@@ -22,5 +22,11 @@
     "due": "2026-10-22T10:33:23",
     "note": "sleep timer for 30 minutes",
     "created": "2026-10-22T10:03:23"
+  },
+  {
+    "minutes": 5.0,
+    "due": "2026-10-22T10:42:33",
+    "note": "sleep timer for 5 minutes",
+    "created": "2026-10-22T10:37:33"
   }
 ]

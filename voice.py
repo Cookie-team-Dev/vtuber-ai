@@ -1,4 +1,5 @@
 import io
+import importlib
 import logging
 import os
 import re
@@ -8,13 +9,26 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 import wave
 from pathlib import Path
+
+from amika_tts_codes import find_sfx_file, parse_speech_codes, piper_emotion
 
 log = logging.getLogger(__name__)
 
 VOICE_MODEL = Path(__file__).resolve().with_name("en_US-amy-medium.onnx")
-VOICE_ENABLED = True
+AMIKA_ENGINE = Path(__file__).resolve().parent / "openamika" / "vendor" / "tts-engine"
+AMIKA_VOICE = AMIKA_ENGINE / "Speakers" / "MekaHime_Amika" / "character.json"
+AMIKA_TTS_URL = os.environ.get("KOOKIE_AMIKA_TTS_URL", "http://127.0.0.1:8002").rstrip("/")
+AMIKA_TTS_SPEED = float(os.environ.get("KOOKIE_AMIKA_SPEED", "1.2"))
+if not 0.5 <= AMIKA_TTS_SPEED <= 2.0:
+    raise ValueError("KOOKIE_AMIKA_SPEED must be between 0.5 and 2.0")
+VOICE_ENABLED = (
+    VOICE_MODEL.exists()
+    or AMIKA_VOICE.exists()
+    or "KOOKIE_AMIKA_TTS_URL" in os.environ
+)
 
 try:
     from piper import PiperVoice, SynthesisConfig
@@ -31,9 +45,8 @@ except Exception:
     np = None
     NUMPY_OK = False
 
-if not VOICE_MODEL.exists():
-    VOICE_ENABLED = False
-    log.warning("Voice model %s not found; voice disabled.", VOICE_MODEL)
+if not VOICE_ENABLED:
+    log.warning("Neither Piper weights nor OpenAmika voice assets are installed; voice disabled.")
 
 _STAGE_DIRECTION_PATTERN = re.compile(r"\*[^*]*\*")
 _EMOJI_PATTERN = re.compile(
@@ -103,6 +116,8 @@ VOICE_LENGTH_SCALES = {
 }
 
 
+_USE_PIPER_ONLY = os.environ.get("KOOKIE_TTS_BACKEND", "").lower() == "piper"
+_AMIKA_WARNED = False
 _AUDIO_PLAYER = None
 
 
@@ -204,22 +219,70 @@ def speak(text, emotion="neutral", intensity=0.5):
     if not VOICE_ENABLED or not text or not text.strip():
         return
 
-    spoken = sanitize_for_speech(text)
-    if not spoken:
-        return
-
     try:
         intensity = min(1.0, max(0.0, float(intensity)))
     except (TypeError, ValueError):
         intensity = 0.5
+
+    segments = parse_speech_codes(text, emotion)
+    played_audio = False
+    for kind, content, segment_emotion in segments:
+        if kind == "sfx":
+            sfx_path = find_sfx_file(content)
+            if sfx_path is None:
+                log.warning(
+                    "Amika speech cue %s skipped; install a matching WAV in speech/static/sfx.",
+                    content,
+                )
+                continue
+            try:
+                subprocess.run(
+                    audio_player(str(sfx_path)),
+                    check=True,
+                    timeout=15,
+                    start_new_session=True,
+                )
+                played_audio = True
+            except subprocess.TimeoutExpired:
+                log.warning("Sound-effect playback timed out for %s", content)
+            except (subprocess.CalledProcessError, FileNotFoundError, RuntimeError) as error:
+                log.warning("Could not play sound effect %s: %s", content, error)
+            continue
+
+        spoken = sanitize_for_speech(content)
+        if not spoken:
+            continue
+        if played_audio:
+            time.sleep(0.2)
+            played_audio = False
+        _speak_text(
+            spoken,
+            piper_emotion(segment_emotion),
+            intensity,
+            amika_emotion=segment_emotion,
+        )
+
+
+def _speak_text(spoken, emotion, intensity, amika_emotion="neutral"):
+    """Prefer OpenAmika GPT-SoVITS, falling back to Piper for this segment."""
     target_scale = VOICE_LENGTH_SCALES.get(str(emotion).casefold(), 1.0)
     length_scale = 1.0 + (target_scale - 1.0) * intensity
 
-    # Use a temp file that we control manually to avoid Windows file locking
     audio_path = None
     try:
         fd, audio_path = tempfile.mkstemp(suffix=".wav")
         os.close(fd)
+        try:
+            _synthesize_with_amika(spoken, amika_emotion, audio_path)
+        except Exception as error:
+            global _AMIKA_WARNED
+            if not _AMIKA_WARNED:
+                _AMIKA_WARNED = True
+                print("OpenAmika TTS unavailable; using Piper.", flush=True)
+        else:
+            _play_synthesized_audio(audio_path)
+            return
+
         try:
             _synthesize_with_piper(spoken, audio_path, length_scale)
         except Exception:
@@ -231,27 +294,158 @@ def speak(text, emotion="neutral", intensity=0.5):
                 return
             except (subprocess.CalledProcessError, FileNotFoundError, ModuleNotFoundError):
                 return
-        try:
-            # A player that never returns would stall the caller forever, and
-            # the caller is the thread that owes the user a reply.
-            subprocess.run(
-                audio_player(audio_path),
-                check=True,
-                timeout=120,
-                start_new_session=True,
-            )
-        except subprocess.TimeoutExpired:
-            log.warning("Audio playback timed out")
-        except (subprocess.CalledProcessError, FileNotFoundError, RuntimeError):
-            # RuntimeError covers "no audio player installed": never let a
-            # silent machine break the reply itself.
-            pass
+        _play_synthesized_audio(audio_path)
     finally:
         if audio_path:
             try:
                 os.unlink(audio_path)
             except OSError:
                 pass
+
+
+def _synthesize_with_amika(text, emotion, wav_path):
+    if _USE_PIPER_ONLY:
+        raise RuntimeError("Piper-only mode")
+    """Request one WAV segment from OpenAmika's local Socket.IO TTS gateway."""
+    socketio = importlib.import_module("socketio")
+    adapter = importlib.import_module("openamika.speech.voice_adapter")
+    po_contract = importlib.import_module("openamika.speech.po_contract")
+    enabled, character_id, emotion_map = adapter.live_state()
+    request_text = f"【{emotion}】.{text}"
+    if enabled:
+        request_text = adapter.remap_leading_tag(request_text, emotion_map)
+    language_code = po_contract.detect_lang(text)
+    language = {"zh": "Chinese", "en": "English", "ja": "Japanese"}.get(
+        language_code, "auto"
+    )
+
+    task_id = str(uuid.uuid4())
+    completed = threading.Event()
+    audio_events = []
+    errors = []
+    client = socketio.Client(reconnection=False, logger=False, engineio_logger=False)
+
+    @client.on("audio_ready")
+    def on_audio_ready(data):
+        if not isinstance(data, dict) or data.get("task_id") != task_id:
+            return
+        audio_events.append(data)
+        if data.get("is_final"):
+            completed.set()
+
+    @client.on("error")
+    def on_error(data):
+        if isinstance(data, dict) and data.get("task_id") == task_id:
+            errors.append(str(data.get("message") or data.get("error") or data))
+            completed.set()
+
+    @client.on("disconnect")
+    def on_disconnect(*_args):
+        if not completed.is_set():
+            errors.append("OpenAmika TTS connection closed before audio completed")
+            completed.set()
+
+    try:
+        client.connect(AMIKA_TTS_URL, transports=["websocket"], wait_timeout=10)
+        client.emit(
+            "tts_request_gateway",
+            {
+                "task_id": task_id,
+                "turn_id": task_id,
+                "text": request_text,
+                "character_id": character_id or "MekaHime_Amika",
+                "language": language,
+                "audio_format": "wav",
+                "speed": AMIKA_TTS_SPEED,
+            },
+        )
+        if not completed.wait(timeout=300):
+            raise TimeoutError("OpenAmika TTS request timed out")
+        if errors:
+            raise RuntimeError(f"OpenAmika TTS failed: {errors[0]}")
+        if not any(isinstance(event.get("audio"), bytes) for event in audio_events):
+            raise RuntimeError("OpenAmika TTS returned no audio")
+        _write_amika_wav(audio_events, wav_path)
+    finally:
+        if client.connected:
+            client.disconnect()
+
+
+def _write_amika_wav(audio_events, wav_path):
+    """Reassemble sentence/chunk events into one playable WAV file."""
+    groups = []
+    active_group = None
+    for event in audio_events:
+        audio = event.get("audio")
+        if not isinstance(audio, bytes):
+            continue
+        chunk_index = event.get("chunk_index")
+        chunk_count = event.get("chunk_count")
+        if isinstance(chunk_index, int) and not isinstance(chunk_index, bool):
+            if chunk_index == 0 or active_group is None:
+                active_group = {"chunks": {}, "count": chunk_count or 1}
+                groups.append(active_group)
+            active_group["chunks"][chunk_index] = audio
+            if len(active_group["chunks"]) >= active_group["count"]:
+                active_group = None
+        else:
+            groups.append({"chunks": {0: audio}, "count": 1})
+            active_group = None
+
+    frames = []
+    wav_params = None
+    for group in groups:
+        chunks = group["chunks"]
+        expected_count = group["count"]
+        if (
+            not isinstance(expected_count, int)
+            or expected_count < 1
+            or len(chunks) != expected_count
+            or set(chunks) != set(range(expected_count))
+        ):
+            raise ValueError("OpenAmika TTS returned incomplete audio chunks")
+        segment = b"".join(chunks[index] for index in range(expected_count))
+        with wave.open(io.BytesIO(segment), "rb") as wav_file:
+            params = wav_file.getparams()
+            segment_frames = wav_file.readframes(wav_file.getnframes())
+        if wav_params is None:
+            wav_params = params
+        elif params[:3] != wav_params[:3]:
+            raise ValueError("OpenAmika TTS returned incompatible WAV sentence formats")
+        frames.append(segment_frames)
+
+    if not frames or wav_params is None:
+        raise RuntimeError("OpenAmika TTS returned no complete WAV audio")
+    with wave.open(wav_path, "wb") as wav_file:
+        wav_file.setparams(wav_params)
+        wav_file.writeframes(b"".join(frames))
+
+
+def synthesize_for_voice_chat(text, wav_path):
+    """Create voice-chat audio with Amika first and Piper as a local fallback."""
+    try:
+        _synthesize_with_amika(text, "neutral", wav_path)
+    except Exception as error:
+        log.warning("OpenAmika voice-chat TTS unavailable; using Piper: %s", error)
+        try:
+            _synthesize_with_piper(text, wav_path, 1.0)
+        except Exception as piper_error:
+            log.warning("In-process Piper voice-chat TTS unavailable; using Piper CLI: %s", piper_error)
+            _synthesize_with_cli(text, wav_path, 1.0)
+
+
+def _play_synthesized_audio(audio_path):
+    try:
+        subprocess.run(
+            audio_player(audio_path),
+            check=True,
+            timeout=120,
+            start_new_session=True,
+        )
+    except subprocess.TimeoutExpired:
+        log.warning("Audio playback timed out")
+    except (subprocess.CalledProcessError, FileNotFoundError, RuntimeError):
+        pass
 
 
 def _read_wav(path):
@@ -411,6 +605,67 @@ def _sing_fragment_via_cli(text, length_scale):
             pass
 
 
+_AMIKA_SERVER_PROC = None
+
+
+def stop_speaking():
+    """Stop all speech playback."""
+    interrupt()
+    """Sing a short line."""
+    try:
+        sing_song([text], emotion="happy", intensity=0.7)
+    except Exception:
+        pass
+    """Speak a short emotion cue."""
+    cues = {"happy": "yay!", "sad": "aww...", "angry": "hmph!", "surprised": "oh!"}
+    try:
+        speak(cues.get(emotion, "hmm"), emotion=emotion, intensity=0.7)
+    except Exception:
+        pass
+    """Speak a recalled memory aloud."""
+    try:
+        speak(text, emotion="curious", intensity=0.6)
+    except Exception:
+        pass
+    """Play a touch reaction vocalization."""
+    try:
+        import vocalizations
+        v = vocalizations.vocalize(context="affection", emotion="happy")
+        if v:
+            speak(v, emotion="happy", intensity=0.7)
+    except Exception:
+        pass
+    """Speak a greeting on startup."""
+    try:
+        speak(text, emotion="happy", intensity=0.8)
+    except Exception:
+        pass
+    """Stop current speech immediately (voice interruption)."""
+    global _AMIKA_WARNED
+    try:
+        import subprocess
+        subprocess.run(["pkill", "-f", "paplay"], capture_output=True)
+        subprocess.run(["pkill", "-f", "aplay"], capture_output=True)
+        subprocess.run(["pkill", "-f", "ffplay"], capture_output=True)
+    except Exception:
+        pass
+    global _AMIKA_SERVER_PROC
+    if _AMIKA_SERVER_PROC is not None:
+        return
+    tts_dir = Path(__file__).resolve().parent / "openamika" / "vendor" / "tts-engine"
+    venv_python = tts_dir / ".venv" / "bin" / "python"
+    if not venv_python.exists():
+        return
+    try:
+        _AMIKA_SERVER_PROC = subprocess.Popen(
+            [str(venv_python), "main.py", "--port", "8002", "--host", "127.0.0.1"],
+            cwd=str(tts_dir),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception:
+        _AMIKA_SERVER_PROC = None
 def _sing_lines_as_speech(lines, emotion, intensity):
     """Last resort: read the lyrics out instead of dropping the song."""
     target_scale = VOICE_LENGTH_SCALES.get(str(emotion).casefold(), 1.0)

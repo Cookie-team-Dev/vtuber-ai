@@ -41,12 +41,16 @@ HELP_TEXT = [
     ("/learn <topic>", "look something up and keep what is worth keeping"),
     ("/opinion [topic]", "ask what she actually thinks"),
     ("/export", "write her training data out"),
+    ("/resources", "show CPU, RAM, and the largest processes"),
+    ("/optimize cpu", "limit Kookie, Amika TTS, and Ollama CPU cores"),
+    ("/optimize memory", "show the confirmation command to unload her model"),
+    ("/optimize restore", "undo Kookie's CPU settings"),
     ("/quit", "stop Kookie"),
 ]
 
 SLASH_COMMANDS = {
     "help", "quit", "exit", "clear", "status", "quiet", "resume", "voice", "think",
-    "learn", "export", "opinion", "discord", "stop", "web",
+    "learn", "export", "opinion", "discord", "stop", "web", "resources", "system", "optimize",
 }
 
 # Browser actions ask "Type CLICK to confirm"; the word is what she expects back.
@@ -773,6 +777,10 @@ class KookieWindow:
                         f"{'avatar connected' if controller.vts else 'no avatar'} · "
                         f"web {'on' if controller.web_server_running() else 'off'} · "
                         f"voice {'muted' if self.muted else 'on'}")
+        elif command in ("resources", "system", "optimize"):
+            result = controller.handle_resource_command(message)
+            for line in result.splitlines():
+                self.system(line)
         elif command == "quiet":
             minutes = None
             for part in parts[1:]:
@@ -907,6 +915,11 @@ def _boot(screen):
 
     window = KookieWindow(screen)
     sys.stdout = _WindowStdout(window.system)
+    try:
+        import omniroute
+        window.system(f"OmniRoute: {omniroute.connection_status()} at {omniroute.OMNIROUTE_URL}")
+    except Exception:
+        pass
     # Browser confirmations have to be asked here: this window owns the
     # terminal, so an input() on the agent thread would never be seen.
     browser.set_confirmation_hook(window.ask_confirmation)

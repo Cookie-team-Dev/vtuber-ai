@@ -1,8 +1,13 @@
 requests
 websocket-client
 piper-tts
+python-socketio[client]
 numpy
 playwright
 discord.py
+discord-ext-voice-recv
 sympy
 pyfiglet
+pypdf
+psutil
+qrcode

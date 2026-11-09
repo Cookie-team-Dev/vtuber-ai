@@ -4,7 +4,7 @@ import tempfile
 import subprocess
 
 try:
-    from moviepy import VideoFileClip
+    from moviepy.video.io.VideoFileClip import VideoFileClip  # type: ignore[import]
     MOVIEPY_AVAILABLE = True
 except Exception:
     VideoFileClip = None
@@ -96,11 +96,10 @@ def extract_audio(input_path, output_path):
     clip = None
     try:
         clip = VideoFileClip(input_path)
+        audio_ok = False
         if clip.audio is not None:
             clip.audio.write_audiofile(output_path, logger=None)
             audio_ok = True
-        else:
-            audio_ok = False
         return output_path if audio_ok else None
     finally:
         if clip is not None:

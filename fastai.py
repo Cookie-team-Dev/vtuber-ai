@@ -22,11 +22,14 @@ All three speak the OpenAI chat API, so they share one code path:
                          costs one entry in this list rather than a second client.
     GROQ_API_KEY        Groq, as a second choice.
     OPENROUTER_API_KEY  OpenRouter last.
+    OMNIROUTE_OMNIOUTE_URL/Omniroute, as a final fallback when every other key
+    is out of room.
 
 Whichever key is present is used, and the order above is the order of
-preference: Gemini, then Groq, then OpenRouter. With none of them set this
-module reports itself unavailable and every caller quietly keeps using the local
-model, so nothing breaks by adding it and nothing is lost by leaving it out.
+preference: Gemini, then Groq, then OpenRouter, then Omniroute. With none of
+them set Omniroute can still answer when installed, and every caller quietly
+keeps using the local model otherwise, so nothing breaks by adding it and
+nothing is lost by leaving it out.
 """
 
 import json
@@ -37,16 +40,169 @@ import time
 
 import requests
 
-# Each entry is (env var name, base url, candidate models, label). The
-# differ only in host, so one request builder covers them both.
-# Each entry is (env var name, base url, candidate models, label). The two URLs
-# differ only in host, so one request builder covers them both. A model ID here
-# is a candidate rather than a fixed choice because these catalogues get retired
-# underneath you: Groq shut llama-3.3-70b-versatile down in August 2026, a month
-# after it was their strongest free model, and a request naming it now fails
-# outright. Pinning one ID means being wrong the day it is switched off, and the
-# symptom is silent, because a failed request falls back to the slow local model
-# and the only thing you notice is that she went back to being slow.
+import omniroute
+
+# ---------------------------------------------------------------------------
+# Automatic model discovery
+#
+# The static candidate list in PROVIDERS is a starting point, not a ceiling.
+# Providers retire models and ship new ones underneath this process, so each
+# provider's /models endpoint is queried once and the fresh list is merged with
+# the static candidates. Newly released models are tried before the static
+# fallback, so she picks up a new Flash or Llama without a code change.
+#
+# Discovery is cached with a TTL so a reply does not pay for an HTTP call, and
+# a network or auth failure silently falls back to the static list - nothing
+# breaks when discovery cannot run.
+# ---------------------------------------------------------------------------
+_MODEL_CACHE = {}  # env_var -> (tuple of model ids, expiry monotonic time)
+_MODEL_TTL_SECONDS = 3600  # refresh the model list once an hour
+_MODEL_FAIL_TTL_SECONDS = 600  # don't retry a failed discovery for 10 minutes
+
+# Don't print the same key error more than once per dedup window. chat() can be
+# called more than once for the same message (initial attempt, then retry after
+# Ollama fails), and without this every key's refusal is logged twice.
+_RECENT_ERRORS = {}  # (env_var, key_number, error_text) -> last print time
+_DEDUP_WINDOW_SECONDS = 5
+
+# Chat-capable model name hints. A discovered model is only used when its name
+# looks like something she can actually talk to: a raw embedding or image gen
+# model is not a chat model.
+_CHAT_MODEL_HINTS = (
+    "flash", "gemini", "llama", "qwen", "mistral", "mixtral", "deepseek",
+    "command", "claude", "gpt", "nemotron", "glm", "hermes",
+)
+_CHAT_MODEL_SKIPS = (
+    "embed", "embedding", "rerank", "image", "generate", "moderation",
+    "whisper", "tts", "audio", "transcrib",
+)
+
+
+def _looks_like_chat_model(model_id):
+    """True when a model name sounds like a chat/completion model."""
+    lowered = model_id.lower()
+    if any(skip in lowered for skip in _CHAT_MODEL_SKIPS):
+        return False
+    return any(hint in lowered for hint in _CHAT_MODEL_HINTS)
+
+
+def _fetch_provider_models(base_url, key):
+    """Ask one provider's /models endpoint for the models it will serve.
+
+    All three providers speak the OpenAI list shape: {"data": [{"id": ...}]}.
+    Returns None on any failure so the caller falls back to the static list.
+    """
+    if not key:
+        return None
+
+    # Try the OpenAI-compatible /models path first, then a provider-specific
+    # fallback. Gemini's own endpoint is generativelanguage.googleapis.com but
+    # its OpenAI-compatible mirror also lists models.
+    candidates = []
+    base = base_url.rstrip("/")
+    if "/openai" in base:
+        candidates.append(base + "/models")
+        candidates.append("https://generativelanguage.googleapis.com/v1beta/models")
+    else:
+        candidates.append(base + "/models")
+        candidates.append(base + "/openai/v1/models")
+
+    last_error = None
+    for url in candidates:
+        try:
+            response = _SESSION.get(
+                url,
+                headers=_provider_headers(
+                    {"label": "Gemini" if "generativelanguage.googleapis.com" in url
+                     else "OpenRouter" if "openrouter.ai" in base else "provider"},
+                    key,
+                ),
+                timeout=15,
+            )
+            if response.status_code >= 400:
+                last_error = f"{url}: HTTP {response.status_code}"
+                continue
+            parsed = response.json()
+            models = []
+            for entry in parsed.get("data") or []:
+                if isinstance(entry, dict):
+                    mid = entry.get("id") or entry.get("name") or ""
+                    parameters = entry.get("supported_parameters")
+                    openrouter_contract_ok = (
+                        "openrouter.ai" not in base
+                        or not isinstance(parameters, list)
+                        or {"tools", "response_format"}.issubset(parameters)
+                    )
+                    if (
+                        mid
+                        and _looks_like_chat_model(mid)
+                        and openrouter_contract_ok
+                    ):
+                        models.append(mid)
+            if models:
+                return tuple(models)
+        except (requests.exceptions.RequestException, ValueError, KeyError, TypeError) as error:
+            last_error = f"{url}: {error}"
+            continue
+    print(f"fastai: model discovery failed ({last_error}), using static list")
+    return None
+
+
+def _provider_headers(provider, key):
+    """Build provider auth headers, including OpenRouter app attribution."""
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+    }
+    if provider.get("label") == "Gemini":
+        headers["x-goog-api-key"] = key
+    elif provider.get("label") == "OpenRouter":
+        headers["HTTP-Referer"] = "https://github.com/Cookie-team-Dev/vtuber-ai"
+        headers["X-Title"] = "Kookie"
+    return headers
+
+
+def _discover_models(env_var, base_url, models, label):
+    """Return the model tuple for one provider: discovered first, static second.
+
+    A pinned model ({env_var}_MODEL) wins outright and discovery is skipped.
+    Otherwise the live provider list is fetched and merged with the static
+    candidates, deduplicated, discovered-first.
+
+    Failures are cached with a short TTL so a single 401 does not log on every
+    reply - the next retry happens after _MODEL_FAIL_TTL_SECONDS.
+    """
+    pinned = _key_for(f"{env_var}_MODEL")
+    if pinned:
+        return tuple(models)
+
+    now = time.monotonic()
+    cached = _MODEL_CACHE.get(env_var)
+    if cached and cached[1] > now:
+        return cached[0]
+
+    key = _key_for(env_var)
+    discovered = _fetch_provider_models(base_url, key)
+    if discovered:
+        # Discovered models first, then static candidates that were not
+        # already discovered. Deduplicated, order preserved.
+        merged = list(discovered)
+        for mid in models:
+            if mid not in merged:
+                merged.append(mid)
+        result = tuple(merged)
+        _MODEL_CACHE[env_var] = (result, now + _MODEL_TTL_SECONDS)
+        return result
+
+    # Discovery failed or returned nothing: cache the static list briefly so
+    # we do not hammer the provider's /models endpoint on every reply.
+    result = tuple(models)
+    _MODEL_CACHE[env_var] = (result, now + _MODEL_FAIL_TTL_SECONDS)
+    print(f"fastai: model discovery failed for {label}, using static list "
+          f"(retry in {_MODEL_FAIL_TTL_SECONDS // 60}m)")
+    return result
+
+
 PROVIDERS = (
     (
         "GEMINI_API_KEY",
@@ -63,8 +219,6 @@ PROVIDERS = (
             "gemini-flash-latest",
             # Fallback to 1.5 Flash if newer models are unavailable.
             "gemini-1.5-flash",
-            # Smaller 1.5 Flash variant.
-            "gemini-1.5-flash-8b",
         ),
         "Gemini",
     ),
@@ -88,7 +242,7 @@ PROVIDERS = (
         "https://openrouter.ai/api/v1",
         (
             "meta-llama/llama-3.3-70b-instruct",
-            "meta-llama/llama-3.1-8b-instant",
+            "meta-llama/llama-3.1-8b-instruct",
         ),
         "OpenRouter",
     ),
@@ -227,6 +381,41 @@ def _env_int(name, default):
 # is only avoided while their cooldowns last.
 _KEY_PREFERENCE = {}
 
+# Persisted across restarts so she stays on the key that worked even after being
+# turned off and back on. Written once she answers on a key, read at import.
+_PREFERENCE_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "kookie_key_preference.json"
+)
+
+
+def _load_preferences():
+    """Read the saved key preference from disk, if any."""
+    global _KEY_PREFERENCE
+    try:
+        with open(_PREFERENCE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            for env_var, slot in data.items():
+                if isinstance(env_var, str) and isinstance(slot, str):
+                    _KEY_PREFERENCE[env_var] = slot
+    except (FileNotFoundError, OSError, ValueError, KeyError, TypeError):
+        # No preference file yet, or it is unreadable: start fresh.
+        pass
+
+
+def _save_preferences():
+    """Write the current key preference to disk."""
+    try:
+        with open(_PREFERENCE_FILE, "w", encoding="utf-8") as f:
+            json.dump(_KEY_PREFERENCE, f, indent=1)
+    except OSError:
+        # Best effort only - a failed write does not stop her answering.
+        pass
+
+
+# Read what was saved last time she ran.
+_load_preferences()
+
 # How much of a key's daily allowance to spend before moving on to the next one.
 # The free tier is 500 requests a day for GenerateRequestsPerDayPerProjectPerModel,
 # measured here as a hard refusal rather than a slowdown, so the last slice is
@@ -265,6 +454,7 @@ def _prefer_key(slot):
     env_var = slot.split("#", 1)[0]
     with _KEY_STATE_LOCK:
         _KEY_PREFERENCE[env_var] = slot
+    _save_preferences()
 
 
 def _key_use(slot):
@@ -311,6 +501,11 @@ def _providers():
         # on its own. Otherwise every candidate is fair game and the request can
         # move on to the next one if this model has been retired.
         chosen = _key_for(f"{env_var}_MODEL")
+        # Model discovery is provider-wide. Resolve it once instead of repeating
+        # the same cache lookup (or failed discovery log) for every configured key.
+        discovered_models = None if chosen else _discover_models(
+            env_var, base_url, models, label
+        )
         for index, key in enumerate(keys):
             found.append({
                 "env_var": env_var,
@@ -322,12 +517,12 @@ def _providers():
                 "key_number": index + 1,
                 "key_count": len(keys),
                 "base_url": base_url.rstrip("/"),
-                "models": (chosen,) if chosen else tuple(models),
+                "models": (chosen,) if chosen else discovered_models,
                 # The rest of this provider's list, kept even when one model was
                 # named. Naming a model says which one to prefer; it does not say
                 # to sit on a dead provider while the local model takes two
                 # minutes to answer, which is the situation this is for.
-                "fallbacks": tuple(models),
+                "fallbacks": tuple(models) if chosen else discovered_models,
                 "pinned": bool(chosen),
                 "label": label,
             })
@@ -352,9 +547,15 @@ def _providers():
         groups[env_var].append(entry)
     ordered = []
     for env_var in order:
+        # Stay on the key that last answered until it stops working. Only when
+        # it is out of room or out of budget does the list fall through to the
+        # next key, and then stay there until that one fails too.
+        preferred = _KEY_PREFERENCE.get(env_var)
         ordered.extend(sorted(
             groups[env_var],
             key=lambda e: (
+                2 if e["slot"] in _KEY_BAD_SESSION else 0,
+                0 if (e["slot"] == preferred and _key_use(e["slot"]) < KEY_DAILY_BUDGET) else 1,
                 1 if _key_use(e["slot"]) >= KEY_DAILY_BUDGET else 0,
                 e["key_number"],
             ),
@@ -723,6 +924,28 @@ def _try_provider_fallbacks(provider, models, messages, tools, tool_choice,
     )
 
 
+def describe_image(image_b64, prompt="Describe this image in detail.", max_tokens=256,
+                   temperature=0.3, timeout=DEFAULT_TIMEOUT):
+    """Ask the fast model to describe a base64-encoded image.
+
+    Returns the text description, or raises FastAIError. Uses the OpenAI
+    compatible image_url form so any provider that supports vision can answer.
+    """
+    if not available():
+        raise FastAIError("no fast provider key is set")
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {
+                "url": f"data:image/jpeg;base64,{image_b64.strip()}",
+            }},
+        ],
+    }]
+    answer = chat(messages, max_tokens=max_tokens, temperature=temperature, timeout=timeout)
+    return answer.get("text", "").strip()
+
+
 def chat(messages, tools=None, tool_choice=None, max_tokens=512, temperature=0.8,
          top_p=0.9, timeout=DEFAULT_TIMEOUT, stop=None, json_mode=False):
     """Ask the fast model, and answer in Ollama's shape.
@@ -733,7 +956,18 @@ def chat(messages, tools=None, tool_choice=None, max_tokens=512, temperature=0.8
     """
     providers = _providers()
     if not providers:
-        raise FastAIError("no fast provider key is set")
+        try:
+            return omniroute.chat(
+                messages, max_tokens=max_tokens, temperature=temperature,
+                top_p=top_p, timeout=timeout, json_mode=json_mode,
+                tools=tools, tool_choice=tool_choice, stop=stop,
+            )
+        except Exception as omni_error:
+            raise FastAIError(
+                f"no fast provider key is set and OmniRoute could not answer: "
+                f"{omni_error}"
+            ) from omni_error
+
 
     last_error = None
     for provider in providers:
@@ -766,18 +1000,34 @@ def chat(messages, tools=None, tool_choice=None, max_tokens=512, temperature=0.8
                 "this key cannot serve it" if _is_key_problem(error)
                 else "the provider did not answer"
             )
-            if later is None:
-                print(
-                    f"{provider['label']} key {provider['key_number']} of "
-                    f"{provider['key_count']} cannot serve this ({reason}): "
-                    f"{error}. Moving to the next provider."
-                )
-                continue
-            print(
-                f"{provider['label']} key {provider['key_number']} of "
-                f"{provider['key_count']} cannot serve this ({reason}): {error}. "
-                f"Moving to key {later['key_number']}."
-            )
+            error_key = (provider["env_var"], provider["key_number"], str(error))
+            now = time.monotonic()
+            last_print = _RECENT_ERRORS.get(error_key, 0.0)
+            if now - last_print >= _DEDUP_WINDOW_SECONDS:
+                recharge = ""
+                if _is_quota(error):
+                    recharge = _recharge_text(provider["slot"], provider["models"])
+                if later is None:
+                    print(
+                        f"{provider['label']} key {provider['key_number']} of "
+                        f"{provider['key_count']} cannot serve this ({reason}): "
+                        f"{error}. Moving to the next provider.{recharge}"
+                    )
+                else:
+                    print(
+                        f"{provider['label']} key {provider['key_number']} of "
+                        f"{provider['key_count']} cannot serve this ({reason}): {error}. "
+                        f"Moving to key {later['key_number']}.{recharge}"
+                    )
+                _RECENT_ERRORS[error_key] = now
+            continue
+    # OmniRoute is the final hosted fallback after all configured providers.
+    try:
+        return omniroute.chat(messages, max_tokens=max_tokens, temperature=temperature,
+                              top_p=top_p, timeout=timeout, json_mode=json_mode,
+                              tools=tools, tool_choice=tool_choice, stop=stop)
+    except Exception as omni_error:
+        print(f"OmniRoute fallback also could not answer: {omni_error}")
     raise FastAIError(str(last_error))
 
 
@@ -790,6 +1040,13 @@ def _chat_one_key(provider, messages, tools, tool_choice, max_tokens,
     """
     slot = provider.get("slot", "")
     last_error = None
+    # A key that already returned a hard key error this session is never worth
+    # trying again - skip it immediately instead of paying a full timeout on
+    # every model before moving to the next key.
+    if slot in _KEY_BAD_SESSION:
+        raise _KeyOutOfRoom(
+            f"{slot} already failed this session, skipping to the next key"
+        )
     tried = _skip_exhausted(provider["models"], slot)
     if provider["pinned"] and not tried:
         # Every candidate was already found out of room on an earlier call, so
@@ -819,10 +1076,15 @@ def _chat_one_key(provider, messages, tools, tool_choice, max_tokens,
                 _note_quota(model, skip, slot)
             continue
         except FastAIError as error:
-            # A timeout, a refused request or an unreadable reply: this model
-            # could not answer, but the next one on the list might. Letting that
-            # out of the loop gave up on the whole key over one bad reply.
+            # A key-level problem (401, invalid key, revoked) means this key is
+            # dead for this session - mark it and move to the next key at once
+            # instead of burning a timeout on every remaining model. Quota and
+            # high-demand errors are temporary: they move to the next key but
+            # this key stays in the running for the next call.
             last_error = error
+            if _is_key_problem(error) and not _is_quota(error):
+                _KEY_BAD_SESSION.add(slot)
+                break
             continue
         _note_working(model, slot)
         return answer
@@ -844,7 +1106,6 @@ def _chat_one_key(provider, messages, tools, tool_choice, max_tokens,
                 messages, tools, tool_choice, max_tokens, temperature, top_p, timeout,
                 stop, json_mode, last_error,
             )
-        raise FastAIError(str(last_error))
     if not tried:
         # Nothing was even asked: every model on this key was already found out
         # of room, which was said when it happened. Marked so the caller can
@@ -983,6 +1244,23 @@ def _retry_delay_text(body):
     return f" (they say it is back in {hours}h {minutes:02d}m)"
 
 
+def _recharge_text(slot, models):
+    """A human-readable note of when this key's models will be back, if any are cooling down."""
+    now = time.monotonic()
+    with _KEY_STATE_LOCK:
+        remaining = []
+        for model in models:
+            until = _exhausted_until.get(_quota_key(slot, model), 0.0)
+            if until > now:
+                seconds = int(until - now)
+                hours, rest = divmod(seconds, 3600)
+                minutes = rest // 60
+                remaining.append(f"{model}: {hours}h {minutes:02d}m")
+    if not remaining:
+        return ""
+    return " (recharge: " + ", ".join(remaining) + ")"
+
+
 def _is_hard_quota(error):
     """Is this one out of room for a while, rather than busy for a moment?
 
@@ -1036,7 +1314,7 @@ def _model_retired(status_code, text):
 # trips before reaching one that works. So remember which ones are out of room,
 # and for how long. Long enough to cover a burst of replies, short enough that a
 # quota that resets is picked up again without anyone restarting anything.
-EXHAUSTED_FOR_SECONDS = 120
+EXHAUSTED_FOR_SECONDS = 30
 # A per-minute limit is back within the minute, so that is how long the key is
 # left alone. Longer than that and the wait is longer than the limit.
 RATE_LIMIT_FOR_SECONDS = 75
@@ -1044,6 +1322,11 @@ RATE_LIMIT_FOR_SECONDS = 75
 # a long time to not try a model because one number in a 429 said so.
 EXHAUSTED_MAX_SECONDS = 3600
 _exhausted_until = {}
+
+# Keys that returned a hard key error (401, invalid key, revoked) during this
+# session. They are skipped without even trying, so a dead key never costs a
+# full timeout before she moves to the next one.
+_KEY_BAD_SESSION = set()
 
 
 def _quota_key(slot, model):
@@ -1187,10 +1470,7 @@ def _ask(provider, model, messages, tools, tool_choice, max_tokens, temperature,
     try:
         response = _SESSION.post(
             f"{provider['base_url']}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {provider['key']}",
-                "Content-Type": "application/json",
-            },
+            headers=_provider_headers(provider, provider["key"]),
             json=body,
             timeout=(CONNECT_TIMEOUT, timeout),
         )
