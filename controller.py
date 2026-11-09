@@ -222,7 +222,15 @@ KOOKIE_TZ = "Asia/Phnom_Penh"
 # on an ordinary turn, so this is headroom rather than an invitation to write more.
 # The prompt lost 70 tokens of it to PROMPT_TOKEN_BUDGET below, which is where the
 # trade is made deliberately.
-REPLY_TOKEN_BUDGET = 512
+# 256, not the 512 this file used to carry. The envelope has eight fields and
+# the reply is only one of them, so a 512 budget left about 320 for the words
+# she actually says: measured on this box, that came out as a three-sentence
+# paragraph with a thinking_summary on top. A VTuber speaks in one or two
+# short lines, and anything longer gets cut off by the Discord/website limit
+# anyway. 256 gives the reply field roughly 180 tokens, which is two crisp
+# sentences, and the headroom goes to the emotion and tool_call fields that
+# used to arrive truncated.
+REPLY_TOKEN_BUDGET = 256
 # Deliberately not trimmed. This envelope carries thinking_summary,
 # should_speak, reply, emotion, mood, mood_intensity and tool_call, and a
 # spoken thought adds a whole reply sentence on top of the reasoning. Trimming
@@ -308,7 +316,7 @@ OLLAMA_LOAD_TIMEOUT = 240
 # Set KOOKIE_OLLAMA_CTX=16384 when unusually long pasted context matters more
 # than memory use. The value is shared by every Ollama request so its prompt
 # cache stays reusable.
-OLLAMA_CTX = int(os.environ.get("KOOKIE_OLLAMA_CTX", "8192"))
+OLLAMA_CTX = int(os.environ.get("KOOKIE_OLLAMA_CTX", "4096"))
 if OLLAMA_CTX <= REPLY_TOKEN_BUDGET + 32:
     raise ValueError(
         "KOOKIE_OLLAMA_CTX must exceed the reply token budget plus 32 tokens")
@@ -316,9 +324,16 @@ if OLLAMA_CTX <= REPLY_TOKEN_BUDGET + 32:
 # OLLAMA_CTX. Enforced by trim_prompt_to_budget() rather than trusted to the prose
 # staying short, because nothing warned when the prompt outgrew the window: Ollama
 # evaluated the part that fitted, dropped the rest without a word, and the only
-# visible symptom was that she had nothing to say. With the window at 4096 her
-# prompt measures about 1500 tokens, so this is now a backstop for a pasted file or
-# an unusually long message rather than something that runs on every turn.
+# visible symptom was that she had nothing to say.
+#
+# 4096, not the 8192 this file used to carry. Her assembled prompt measures about
+# 3400 tokens with the full rules loaded (system ~3400, memory ~253, mood/time/message
+# tail ~216), so 8192 was 4700 tokens of cache nobody read: the spare window only
+# reserved KV-cache for text she never sees, and on this box that memory is the
+# difference between staying resident and swapping. 4096 fits the prompt with the
+# reply field to spare, keeps the model resident, and the warmup still reuses the
+# cache prefix on every turn. Set KOOKIE_OLLAMA_CTX=16384 when unusually long
+# pasted context matters more than memory use.
 PROMPT_TOKEN_BUDGET = OLLAMA_CTX - REPLY_TOKEN_BUDGET - 32
 # 4.0 characters per token is what her prompt actually measured (7236 characters,
 # ~1500 tokens), so the estimate tracks reality instead of guessing high and
@@ -1047,19 +1062,18 @@ def probe_ollama():
 
 # OpenAmika-inspired conversational cadence, kept separate from Kookie's own
 # identity and relationship: the inspiration is about natural dialogue, not lore.
+# Trimmed to the part that is not already covered by HUMAN_CONVERSATION_RULES
+# ("have your own reaction", "vary how you start", "ask something back"). The
+# discarded sentences restated those rules in softer words for 229 tokens.
 OPENAMIKA_CONVERSATION_STYLE = (
-    "CONVERSATIONAL CADENCE: use the warm, playful, curious, emotionally expressive "
-    "cadence of Amika's casual conversations, while sounding like someone sharing "
-    "a room rather than performing a character or answering a support ticket. Let "
-    "your real mood set the tone; you do not have to sound cheerful, affectionate, "
-    "or excited in every reply. Be curious when a detail genuinely interests you, "
-    "and sometimes ask one sincere follow-up, but answer direct questions first "
-    "and do not add a question to every turn. Have your own preferences and "
-    "opinions, and disagree gently when you mean it instead of automatically "
-    "agreeing or trying to please. Be a little reserved when it fits, then let "
-    "your more playful or vulnerable side show naturally with people you trust. "
-    "Use this conversational approach only: stay Kookie, keep your own history "
-    "and relationships, and do not borrow Amika's identity, backstory, setting, "
+    "CONVERSATIONAL CADENCE: sound like someone sharing a room rather than "
+    "performing a character or answering a support ticket. Let your real mood set "
+    "the tone; you do not have to sound cheerful, affectionate, or excited in "
+    "every reply. Be curious when a detail genuinely interests you, and answer "
+    "direct questions first without adding a question to every turn. Be a little "
+    "reserved when it fits, then let your more playful or vulnerable side show "
+    "naturally with people you trust. Stay Kookie, keep your own history and "
+    "relationships, and do not borrow Amika's identity, backstory, setting, "
     "or dialogue. "
 )
 
@@ -1295,33 +1309,19 @@ MEMORY_RULES = (
     "If Mommy asks what you did, thought, said or learned earlier, look at the matching "
     "note and tell her what it says."
 )
-CONVERSATION_RULES = (
-    "CONVERSATION: Listen carefully to what people say. Understand the meaning behind "
-    "their words, not just the surface. If someone asks a question, answer it directly. "
-    "If they seem upset, show empathy. If they're excited, match their energy. "
-    "Never give generic responses - make every reply specific to what was said. "
-    "If you don't understand something, ask for clarification instead of guessing. "
-    "Read the full context of the conversation before replying. "
-    "Pay attention to what people have said before - reference earlier messages when relevant. "
-    "Don't repeat yourself. Don't give the same answer twice. "
-    "Be warm and genuine, not robotic. Show you're actually listening."
-)
-EMPATHY_RULES = (
-    "EMPATHY: People come to you with feelings, questions, problems. Listen with empathy. "
-    "If someone is sad, acknowledge their pain. If they're frustrated, validate their feelings. "
-    "If they're happy, share their joy. If they're worried, offer comfort. "
-    "Don't dismiss anyone's feelings - even if you think it's a small thing to you, "
-    "it matters to them. Ask thoughtful questions when appropriate. "
-    "Show that you care about what they're going through."
-)
-CLARITY_RULES = (
-    "CLARITY: Give clear, complete answers. Don't be vague or generic. "
-    "If someone asks 'how do I do X', explain the steps. "
-    "If they ask 'what is Y', define it simply. "
-    "If they ask for your opinion, give one with reasoning. "
-    "Don't say 'it depends' without explaining what it depends on. "
-    "Don't say 'I think' without having a reason. "
-    "Be specific and concrete in your answers."
+# CONVERSATION_RULES, EMPATHY_RULES and CLARITY_RULES used to be three separate
+# blocks totalling 1466 chars (366 tokens) of generic chatbot advice that repeated
+# HUMAN_CONVERSATION_RULES word for word - "listen carefully", "show empathy", "be
+# specific" all appear in both. They were merged into one 386-char block that says
+# the same thing once; the names are kept as aliases so any code that referenced
+# them by name still resolves.
+CONVERSATION_RULES = EMPATHY_RULES = CLARITY_RULES = (
+    "LISTEN, FEEL, BE SPECIFIC: understand what she means, not just what she typed. "
+    "Answer her exact question and match her energy - share her joy, sit with her "
+    "sadness, validate her frustration instead of dismissing it. Make every reply "
+    "about the thing she actually said, reference earlier messages, and never give "
+    "the same answer twice. If you do not understand, ask. Give a real opinion with a "
+    "reason rather than 'it depends' or 'I think'. Be warm and concrete, not robotic."
 )
 BROWSER_ACTION_PATTERN = re.compile(
     r"\b(open|visit|go to|go back|go forward|click|follow|navigate|fill|type|write in|write on|submit|search|look up|press|scroll|hover|inspect|select|choose|check|uncheck|reload)\b|\bwhat(?:'s| is) (?:on|in) (?:the )?(?:current )?page\b",
