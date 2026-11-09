@@ -13319,7 +13319,7 @@ def warm_prompt_cache_in_background():
     return thread
 
 
-def chat_system_prompt(message="", tools_enabled=False, emotion_options="", voice_mode=False, focused=False):
+def chat_system_prompt(message="", tools_enabled=False, emotion_options="", voice_mode=False, focused=False, light=False):
     """Her rules for an ordinary reply, as one string.
 
     A function rather than an f-string inside ask_ai so the startup warmup can
@@ -13335,6 +13335,12 @@ def chat_system_prompt(message="", tools_enabled=False, emotion_options="", voic
     Focused mode keeps the read-the-message rule and the envelope rules, drops
     the personality, and adds a short "show your work" instruction instead. The
     answer is the same either way; this is about giving the model room to think.
+
+    `light` is true for a greeting or farewell. The tool prompt alone is 2,504
+    tokens, and on "hi" or "bye" not one of those tools is going to be called -
+    the model just has to read past all of them to find the one short sentence it
+    should say. Light mode keeps a warm one-liner and the envelope rules, drops
+    the tools and the rest of the personality. Same reply, much less to read.
     """
     voice_rules = (
         ""
@@ -13362,6 +13368,19 @@ def chat_system_prompt(message="", tools_enabled=False, emotion_options="", voic
                 "budget. "
             )
             + (TOOL_PROMPT if tools_enabled else "")
+        )
+        return system
+    if light:
+        system = (
+            READ_THE_MESSAGE_RULES
+            + voice_rules
+            + LIGHT_RULES
+            + (
+                "LEAVE THE ENVELOPE ALONE on an ordinary reply: thinking_summary is empty "
+                "unless she asks how you worked something out, and singing, song_lyrics and "
+                "song_name stay empty unless you are really singing. Her reply is the whole "
+                "budget. "
+            )
         )
         return system
     system = (
@@ -13526,6 +13545,22 @@ MATH_REQUEST_PATTERN = re.compile(
     r")",
     re.IGNORECASE,
 )
+
+# A greeting, farewell, or simple acknowledgment: the one kind of message where
+# the 2,500-token tool prompt is pure waste, because not one of those tools is
+# going to be called. On these she gets light mode instead - a warm one-liner
+# and the envelope rules, nothing else.
+LIGHT_REQUEST_PATTERN = re.compile(
+    r"^\s*(?:"
+    r"hi\b|hey\b|hello\b|yo\b|sup\b|howdy\b|greetings?\b|"
+    r"good\s+(?:morning|afternoon|evening|day)\b|"
+    r"bye\b|goodbye\b|see\s+you\b|later\b|cya\b|farewell\b|"
+    r"thanks?\b|thx\b|ty\b|thank\s+you\b|you're\s+welcome\b|"
+    r"ok\b|okay\b|sure\b|yep\b|yeah\b|yessir\b|ma'am\b|"
+    r"what's\s+up|what\s+up|wassup\b|how\s+are\s+you\b|how\s+do\s+you\s+do\b"
+    r")\W*$",
+    re.IGNORECASE,
+)
 MATH_RULES = (
     "MATHS: never do arithmetic in your head - you will get it wrong and a wrong "
     "number said confidently is worse than no number. Call calculate() with the "
@@ -13553,6 +13588,19 @@ FOCUS_RULES = (
     "personality or emotion to the answer. Use the MATHS rule above: the number "
     "in the MATHS, ALREADY WORKED OUT block is the answer - say it plainly and "
     "do not recalculate it yourself."
+)
+
+# A third, even smaller rule set for the one kind of message where the tool
+# list is pure waste: a greeting, farewell, or simple acknowledgment. The tool
+# prompt alone is 2,504 tokens, and on "hi" or "bye" not one of those tools is
+# going to be called - the model just has to read past all of them to find the
+# one short sentence it should say. Light mode keeps a warm one-liner and the
+# envelope rules, drops the tools and the rest of the personality. Same reply,
+# much less to read.
+LIGHT_RULES = (
+    "LIGHT MODE: this is a quick greeting or acknowledgment. Reply in one short, "
+    "warm sentence. Do not use any tools, do not list them, and do not explain "
+    "your reasoning. Just be Kookie for a moment."
 )
 
 
@@ -13751,9 +13799,20 @@ def ask_ai(
     # read-the-message rule and the envelope rules and drops the rest, so the
     # model has room to work through the problem. The answer is the same.
     focused = bool(MATH_REQUEST_PATTERN.search(str(message or "")))
+    # A greeting or farewell is the other place where most of the prompt is
+    # waste: the 2,500-token tool list is never going to be called on "hi", and
+    # the model just has to read past all of it to find the one short sentence
+    # it should say. Light mode keeps a warm one-liner and the envelope rules,
+    # drops the tools and the rest of the personality. Same reply, less to read.
+    light = (
+        not focused
+        and not autonomous
+        and bool(LIGHT_REQUEST_PATTERN.search(str(message or "")))
+    )
 
     system = chat_system_prompt(
-        message, tools_enabled, emotion_options, voice_mode=voice_mode, focused=focused
+        message, tools_enabled, emotion_options, voice_mode=voice_mode,
+        focused=focused, light=light,
     )
     now_str = datetime.now(ZoneInfo(KOOKIE_TZ)).strftime("%A, %B %d, %Y at %I:%M %p")
     # One builder for both prompt kinds: chat and idle thinking read the same

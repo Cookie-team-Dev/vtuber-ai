@@ -48,3 +48,38 @@ class FocusedPromptTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LightPromptTests(unittest.TestCase):
+    def test_light_prompt_is_smaller_than_full(self):
+        full = controller.chat_system_prompt("hi", True, "neutral")
+        light = controller.chat_system_prompt("hi", True, "neutral", light=True)
+        self.assertLess(len(light), len(full) // 3)
+
+    def test_light_prompt_drops_the_tool_list(self):
+        light = controller.chat_system_prompt("hi", True, "neutral", light=True)
+        self.assertNotIn("calculate(maths)", light)
+
+    def test_light_prompt_keeps_a_warm_rule(self):
+        light = controller.chat_system_prompt("hi", True, "neutral", light=True)
+        self.assertIn("warm", light.lower())
+
+    def test_light_prompt_keeps_the_envelope_rules(self):
+        light = controller.chat_system_prompt("bye", True, "neutral", light=True)
+        self.assertIn("LEAVE THE ENVELOPE ALONE", light)
+
+    def test_light_pattern_matches_greetings_and_farewells(self):
+        for msg in ("hi", "hey", "hello", "good morning", "bye", "thanks",
+                    "ok", "what's up", "how are you"):
+            self.assertTrue(
+                controller.LIGHT_REQUEST_PATTERN.search(msg),
+                f"{msg!r} should match the light pattern",
+            )
+
+    def test_light_pattern_rejects_real_questions(self):
+        for msg in ("what is the weather", "tell me a joke", "sing something",
+                    "what time is it", "how does this work"):
+            self.assertFalse(
+                controller.LIGHT_REQUEST_PATTERN.search(msg),
+                f"{msg!r} should not match the light pattern",
+            )
