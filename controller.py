@@ -15852,6 +15852,70 @@ def discord_switch_command(text):
     return note
 
 
+def check_email():
+    """Check the inbox and summarise the unread messages.
+
+    Reads KOOKIE_EMAIL_HOST / KOOKIE_EMAIL_USER / KOOKIE_EMAIL_PASSWORD.
+    With none set this returns a short hint rather than crashing the caller.
+    """
+    import os
+    host = os.environ.get("KOOKIE_EMAIL_HOST", "").strip()
+    user = os.environ.get("KOOKIE_EMAIL_USER", "").strip()
+    password = os.environ.get("KOOKIE_EMAIL_PASSWORD", "").strip()
+    if not host or not user or not password:
+        return "Email is not configured. Set KOOKIE_EMAIL_HOST, KOOKIE_EMAIL_USER and KOOKIE_EMAIL_PASSWORD."
+    import imaplib
+    import email
+    from email.header import decode_header
+    mailbox = None
+    try:
+        mailbox = imaplib.IMAP4_SSL(host)
+        mailbox.login(user, password)
+        mailbox.select("INBOX")
+        status, data = mailbox.search(None, "(UNSEEN)")
+        if status != "OK" or not data or not data[0]:
+            return "No unread email."
+        ids = data[0].split()
+        if len(ids) > 10:
+            ids = ids[-10:]
+        lines = []
+        for uid in ids:
+            status, msg_data = mailbox.fetch(uid, "(RFC822)")
+            if status != "OK" or not msg_data or not msg_data[0]:
+                continue
+            raw = msg_data[0][1]
+            message = email.message_from_bytes(raw)
+            subject, encoding = decode_header(message.get("Subject", ""))[0] or ("", None)
+            if isinstance(subject, bytes):
+                subject = subject.decode(encoding or "utf-8", "replace")
+            sender = str(message.get("From", "")).strip()
+            body = ""
+            if message.is_multipart():
+                for part in message.walk():
+                    if part.get_content_type() == "text/plain":
+                        payload = part.get_payload(decode=True)
+                        if payload:
+                            body = payload.decode("utf-8", "replace")
+                        break
+            else:
+                payload = message.get_payload(decode=True)
+                if payload:
+                    body = payload.decode("utf-8", "replace")
+            snippet = " ".join(body.split())[:120]
+            lines.append(f"From: {sender} | Subject: {subject} | {snippet}")
+    except Exception as error:  # noqa: BLE001 - surface to the caller
+        return f"Could not check email: {error}"
+    finally:
+        if mailbox is not None:
+            try:
+                mailbox.logout()
+            except Exception:
+                pass
+    if not lines:
+        return "No unread email."
+    return f"{len(lines)} unread:\n" + "\n".join(lines)
+
+
 def stop_discord_bot():
     """Take her off Discord, and say plainly whether it worked.
 
