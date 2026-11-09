@@ -12,7 +12,14 @@ set -uo pipefail
 # Where this script really lives, whether it was run as
 # ./Kookie, as kookie from the PATH, or through a symlink
 # such as ~/.local/bin/kookie.
-SOURCE="${BASH_SOURCE[0]}"
+SOURCE="${BASH_SOURCE[0]:-$0}"
+# A script piped into `bash` has $0 as the bash binary and BASH_SOURCE unset,
+# so both expansions are empty and the resolved path is garbage. Fall back to
+# the current directory, which is where a piped invocation like
+# `sed -n ... ./Kookie | bash` is run from.
+if [[ -z "$SOURCE" || "$SOURCE" == "bash" || "$SOURCE" == "sh" || "$SOURCE" == */bash || "$SOURCE" == */sh ]]; then
+  SOURCE="$PWD/Kookie"
+fi
 if [[ "$SOURCE" != */* ]]; then
   SOURCE="$(command -v "$SOURCE")" || exit 1
 fi
@@ -56,6 +63,22 @@ for OLLAMA_PATH in /api/generate /api/tags /api; do
   esac
 done
 export OLLAMA_BASE
+
+# Source the project .env so cloud API keys (GEMINI_API_KEY, OPENROUTER_API_KEY,
+# GROQ_API_KEY, KOOKIE_OMNIROUTE_API_KEY, TTS knobs, ...) are present for a real
+# ./Kookie run. fastai.py reads .env itself, but it is only consulted when the
+# key is already in the environment -- without this, every reply falls through
+# to the slow local model. Env vars set in the real environment always win.
+# DIR is this script's directory, resolved above, so the .env lives beside it.
+_KOOK_ENV="$DIR/.env"
+if [ -f "$_KOOK_ENV" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "$_KOOK_ENV"
+  set +a
+fi
+unset _KOOK_ENV
+
 OLLAMA_URL="$OLLAMA_BASE/api/tags"
 OLLAMA_GENERATE_URL="$OLLAMA_BASE/api/generate"
 

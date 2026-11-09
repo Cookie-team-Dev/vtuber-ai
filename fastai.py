@@ -37,6 +37,7 @@ import os
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
@@ -89,7 +90,6 @@ def _looks_like_chat_model(model_id):
 def _fetch_provider_models(base_url, key):
     """Ask one provider's /models endpoint for the models it will serve.
 
-    All three providers speak the OpenAI list shape: {"data": [{"id": ...}]}.
     Returns None on any failure so the caller falls back to the static list.
     """
     if not key:
@@ -110,12 +110,22 @@ def _fetch_provider_models(base_url, key):
     last_error = None
     for url in candidates:
         try:
+            # Gemini's native endpoint authenticates the key as a query string
+            # parameter; the x-goog-api-key header alone is a 401. OpenAI-style
+            # providers reject an unknown query parameter, so it is only added
+            # for the generativelanguage host.
+            params = (
+                {"key": key}
+                if "generativelanguage.googleapis.com" in url
+                else None
+            )
             response = _SESSION.get(
                 url,
+                params=params,
                 headers=_provider_headers(
                     {"label": "Gemini" if "generativelanguage.googleapis.com" in url
                      else "OpenRouter" if "openrouter.ai" in base else "provider"},
-                    key,
+                    key, url,
                 ),
                 timeout=15,
             )
@@ -124,21 +134,37 @@ def _fetch_provider_models(base_url, key):
                 continue
             parsed = response.json()
             models = []
-            for entry in parsed.get("data") or []:
-                if isinstance(entry, dict):
-                    mid = entry.get("id") or entry.get("name") or ""
+            # Both providers' list shapes are handled here. OpenAI returns
+            # {"data": [{"id": "..."}]}; Gemini returns
+            # {"models": [{"name": "models/gemini-2.5-flash"}]} where the id
+            # carries a "models/" prefix that has to be stripped before use.
+            raw_entries = parsed.get("data") or parsed.get("models") or []
+            for entry in raw_entries:
+                if not isinstance(entry, dict):
+                    continue
+                mid = entry.get("id") or entry.get("name") or ""
+                if mid.startswith("models/"):
+                    mid = mid[len("models/"):]
+                if not mid:
+                    continue
+                if "generativelanguage.googleapis.com" in base:
+                    methods = entry.get("supportedGenerationMethods") or []
+                    if (
+                        isinstance(methods, list)
+                        and "generateContent" not in methods
+                    ):
+                        continue
+                else:
                     parameters = entry.get("supported_parameters")
                     openrouter_contract_ok = (
                         "openrouter.ai" not in base
                         or not isinstance(parameters, list)
                         or {"tools", "response_format"}.issubset(parameters)
                     )
-                    if (
-                        mid
-                        and _looks_like_chat_model(mid)
-                        and openrouter_contract_ok
-                    ):
-                        models.append(mid)
+                    if not openrouter_contract_ok:
+                        continue
+                if _looks_like_chat_model(mid):
+                    models.append(mid)
             if models:
                 return tuple(models)
         except (requests.exceptions.RequestException, ValueError, KeyError, TypeError) as error:
@@ -148,18 +174,97 @@ def _fetch_provider_models(base_url, key):
     return None
 
 
-def _provider_headers(provider, key):
-    """Build provider auth headers, including OpenRouter app attribution."""
-    headers = {
-        "Authorization": f"Bearer {key}",
-        "Content-Type": "application/json",
-    }
-    if provider.get("label") == "Gemini":
+def _provider_headers(provider, key, url=""):
+    """Build provider auth headers, including OpenRouter app attribution.
+
+    Gemini speaks two endpoints and they want different credentials. The native
+    generateContent path takes the key as x-goog-api-key; the OpenAI-compatible
+    /chat/completions path takes it as an Authorization: Bearer header and
+    rejects x-goog-api-key with "Missing or invalid Authorization header". The
+    same key therefore has to be sent in the shape each endpoint expects, which
+    is why the URL is part of the call here rather than just the label.
+    """
+    headers = {"Content-Type": "application/json"}
+    label = provider.get("label") if isinstance(provider, dict) else provider
+    if label == "Gemini" and "chat/completions" not in url:
         headers["x-goog-api-key"] = key
-    elif provider.get("label") == "OpenRouter":
+    else:
+        headers["Authorization"] = "Bearer " + key
+    if label == "OpenRouter":
         headers["HTTP-Referer"] = "https://github.com/Cookie-team-Dev/vtuber-ai"
         headers["X-Title"] = "Kookie"
     return headers
+
+
+_PROBE_TIMEOUT = 8  # seconds per model; a model that has not answered by then
+                     # is treated as unavailable for this discovery cycle.
+_PROBE_BUDGET = 20  # hard cap on the whole probe, so a provider that is slow
+                    # across the board never delays the first reply by minutes.
+
+
+def _probe_live_models(base_url, key, models, label):
+    """Trim a discovered list to the models this key can actually answer.
+
+    Set KOOKIE_PROBE_LIVE=0 to skip the probes - the tests and anything else
+    that imports this module without wanting to hit a provider need the
+    discovered list returned unchanged.
+
+    The /models endpoint lists what a provider *sells*; it says nothing about
+    what this key can reach today. Measured here on the Gemini free tier:
+    gemini-2.5-flash and gemini-2.5-pro both 404 "no longer available to new
+    users", gemini-flash-latest 429s, gemini-3.8-flash hangs 25s before a read
+    timeout, and gemini-3.5-flash answers the same 1-token probe in 0.8s. With
+    23 listed models, asking every one on every reply is what turned a hosted
+    reply into a 68s wait, so the list is trimmed to the ones that answer -
+    once per discovery TTL, in parallel, and never longer than the budget.
+    """
+    if os.environ.get("KOOKIE_PROBE_LIVE", "1").lower() in ("0", "false", "no"):
+        return models
+    if not models:
+        return models
+    native = "generativelanguage.googleapis.com" in base_url
+    deadline = time.monotonic() + _PROBE_BUDGET
+    results = {}
+
+    def probe(model):
+        if time.monotonic() > deadline:
+            return model, False
+        body = (
+            {"contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+             "generationConfig": {"maxOutputTokens": 4, "temperature": 0}}
+            if native else
+            {"model": model, "messages": [{"role": "user", "content": "hi"}],
+             "max_tokens": 4, "temperature": 0}
+        )
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{model}:generateContent"
+            if native else f"{base_url.rstrip('/')}/chat/completions"
+        )
+        try:
+            response = _SESSION.post(
+                url,
+                headers=_provider_headers(
+                    {"label": label}, key, url if native else ""
+                ),
+                json=body,
+                timeout=(CONNECT_TIMEOUT, _PROBE_TIMEOUT),
+            )
+            return model, response.status_code == 200
+        except requests.exceptions.RequestException:
+            return model, False
+
+    workers = min(len(models), 8)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for model, ok in pool.map(probe, models):
+            results[model] = ok
+    live = [m for m in models if results.get(m)]
+    if not live:
+        # Nothing answered in the budget: keep the original list rather than
+        # dropping the provider entirely, since the failures may all be
+        # transient and the probe itself is only one snapshot.
+        return models
+    return live
 
 
 def _discover_models(env_var, base_url, models, label):
@@ -181,7 +286,10 @@ def _discover_models(env_var, base_url, models, label):
     if cached and cached[1] > now:
         return cached[0]
 
-    key = _key_for(env_var)
+    # keys_for splits the comma/space-separated list; _key_for would return the
+    # whole blob as one key and every discovery call would 401.
+    all_keys = keys_for(env_var)
+    key = all_keys[0] if all_keys else _key_for(env_var)
     discovered = _fetch_provider_models(base_url, key)
     if discovered:
         # Discovered models first, then static candidates that were not
@@ -190,6 +298,14 @@ def _discover_models(env_var, base_url, models, label):
         for mid in models:
             if mid not in merged:
                 merged.append(mid)
+        # A listing says a model exists; it does not say the key can use it.
+        # Measured here, gemini-2.5-flash and gemini-2.5-pro both 404 "no
+        # longer available to new users", gemini-flash-latest 429s on the free
+        # tier, and gemini-3.8-flash hangs for 25s before timing out - while
+        # gemini-3.5-flash answers the same 1-token probe in 0.8s. Asking all
+        # 23 of them on every reply is what made a hosted reply cost 68s, so the
+        # list is trimmed to the ones that actually answer, once per TTL.
+        merged = _probe_live_models(base_url, key, merged, label)
         result = tuple(merged)
         _MODEL_CACHE[env_var] = (result, now + _MODEL_TTL_SECONDS)
         return result
@@ -208,17 +324,16 @@ PROVIDERS = (
         "GEMINI_API_KEY",
         "https://generativelanguage.googleapis.com/v1beta/openai",
         (
-            # Primary: Gemini 3 Flash Preview - fast, smart, free tier
-            "gemini-3-flash-preview",
-            # Gemini 3.1 Pro Preview - much smarter (paid tier)
-            "gemini-3.1-pro-preview",
-            # Gemini 3.1 Flash Lite - fastest, cheapest
-            "gemini-3.1-flash-lite",
-            # Alias rather than a dated ID: Google keeps flash-latest pointing at
-            # the current Flash, so it cannot be retired out from under this.
-            "gemini-flash-latest",
-            # Fallback to 1.5 Flash if newer models are unavailable.
-            "gemini-1.5-flash",
+            # Discovery populates this first; the static list is the fallback
+            # only when the /models call fails. Ordered by what actually answers
+            # on the free tier today: gemini-2.5-flash and gemini-2.5-pro 404
+            # "no longer available to new users", gemini-flash-latest 429s,
+            # gemini-3.8-flash hangs 25s before a read timeout, and
+            # gemini-3.5-flash answers a 1-token probe in 0.8s.
+            "gemini-3.5-flash",
+            "gemini-3.5-flash-lite",
+            "gemini-3.6-flash",
+            "gemini-3.7-flash",
         ),
         "Gemini",
     ),
@@ -1470,7 +1585,8 @@ def _ask(provider, model, messages, tools, tool_choice, max_tokens, temperature,
     try:
         response = _SESSION.post(
             f"{provider['base_url']}/chat/completions",
-            headers=_provider_headers(provider, provider["key"]),
+            headers=_provider_headers(provider, provider["key"],
+                                   f"{provider['base_url']}/chat/completions"),
             json=body,
             timeout=(CONNECT_TIMEOUT, timeout),
         )
