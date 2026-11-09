@@ -24,6 +24,18 @@ AMIKA_TTS_URL = os.environ.get("KOOKIE_AMIKA_TTS_URL", "http://127.0.0.1:8002").
 AMIKA_TTS_SPEED = float(os.environ.get("KOOKIE_AMIKA_SPEED", "1.2"))
 if not 0.5 <= AMIKA_TTS_SPEED <= 2.0:
     raise ValueError("KOOKIE_AMIKA_SPEED must be between 0.5 and 2.0")
+
+# One global speaking-rate multiplier on top of the per-emotion scales below.
+# The emotion scales already push most moods under 1.0 (excited 0.88, angry 0.93)
+# because a streamer's natural pace is quicker than neutral, and this used to
+# be the only knob - so "speak faster" meant editing twelve numbers. It is now
+# one env var, applied to the Piper length_scale and the OpenAmika speed in the
+# same direction: lower is faster, for both. 0.85 is a 15% cut with the voices
+# still intelligible; below about 0.75 the SoVITS decoder starts dropping
+# syllables and it reads as rushed rather than quick.
+TTS_SPEED = float(os.environ.get("KOOKIE_TTS_SPEED", "0.85"))
+if not 0.5 <= TTS_SPEED <= 2.0:
+    raise ValueError("KOOKIE_TTS_SPEED must be between 0.5 and 2.0")
 VOICE_ENABLED = (
     VOICE_MODEL.exists()
     or AMIKA_VOICE.exists()
@@ -266,7 +278,7 @@ def speak(text, emotion="neutral", intensity=0.5):
 def _speak_text(spoken, emotion, intensity, amika_emotion="neutral"):
     """Prefer OpenAmika GPT-SoVITS, falling back to Piper for this segment."""
     target_scale = VOICE_LENGTH_SCALES.get(str(emotion).casefold(), 1.0)
-    length_scale = 1.0 + (target_scale - 1.0) * intensity
+    length_scale = (1.0 + (target_scale - 1.0) * intensity) * TTS_SPEED
 
     audio_path = None
     try:
@@ -356,7 +368,9 @@ def _synthesize_with_amika(text, emotion, wav_path):
                 "character_id": character_id or "MekaHime_Amika",
                 "language": language,
                 "audio_format": "wav",
-                "speed": AMIKA_TTS_SPEED,
+                # KOOKIE_AMIKA_SPEED is the raw engine factor; TTS_SPEED is the
+                # global knob on top of it, so one env var moves both paths.
+                "speed": AMIKA_TTS_SPEED * TTS_SPEED,
             },
         )
         if not completed.wait(timeout=300):

@@ -69,7 +69,12 @@ class AmikaTTSClientTests(unittest.TestCase):
             self.assertEqual(event_name, "tts_request_gateway")
             self.assertIn("【happy2】", payload["text"])
             self.assertEqual(payload["language"], "English")
-            self.assertEqual(payload["speed"], voice.AMIKA_TTS_SPEED)
+            # KOOKIE_TTS_SPEED multiplies the raw engine factor, so the request
+            # carries the product - one env var moves both the OpenAmika and
+            # the Piper paths.
+            self.assertEqual(
+                payload["speed"], voice.AMIKA_TTS_SPEED * voice.TTS_SPEED
+            )
             first_sentence = self._wav_bytes(b"\x01\x00" * 10)
             second_sentence = self._wav_bytes(b"\x02\x00" * 12)
             split = len(first_sentence) // 2
