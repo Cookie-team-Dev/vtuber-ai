@@ -13585,9 +13585,8 @@ MATH_RULES = (
 FOCUS_RULES = (
     "FOCUS MODE: this is a maths question. Answer it directly and show your "
     "working in a few short lines. Do not greet, do not deflect, do not add "
-    "personality or emotion to the answer. Use the MATHS rule above: the number "
-    "in the MATHS, ALREADY WORKED OUT block is the answer - say it plainly and "
-    "do not recalculate it yourself."
+    "personality or emotion to the answer. The answer is in the MATHS, ALREADY "
+    "WORKED OUT block below - say it plainly and do not recalculate it yourself."
 )
 
 # A third, even smaller rule set for the one kind of message where the tool
